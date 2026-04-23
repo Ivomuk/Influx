@@ -1,4 +1,4 @@
-WITH base_events AS (
+WITH raw_base AS (
     SELECT
         CAST(date_parse(CAST(date_key AS varchar), '%Y%m%d') AS date) AS event_dt,
         inserted_dt,
@@ -9,6 +9,24 @@ WITH base_events AS (
         from_msisdn,
         to_msisdn,
         CAST(replace(CAST(txn_value AS varchar), ',', '') AS double) AS txn_value_num,
+        from_profile,
+        to_profile,
+        from_sp,
+        to_sp
+    FROM analytics.momo_tran_loc_mapping_v2
+    WHERE date_key BETWEEN 20260401 AND 20260430
+),
+base_events AS (
+    SELECT
+        event_dt,
+        inserted_dt,
+        fid,
+        service_name,
+        sub_service_name,
+        instruct_hdr_type,
+        from_msisdn,
+        to_msisdn,
+        txn_value_num,
         from_profile,
         to_profile,
         from_sp,
@@ -96,10 +114,22 @@ WITH base_events AS (
                  AND lower(sub_service_name) NOT LIKE '%repayment%'
                 THEN 1
             ELSE 0
-        END AS alt_credit_signal_flag
+        END AS alt_credit_signal_flag,
 
-    FROM analytics.momo_tran_loc_mapping_v2
-    WHERE date_key BETWEEN 20260401 AND 20260430
+        CASE
+            WHEN lower(sub_service_name) LIKE '%disbursement%' THEN txn_value_num
+            WHEN lower(sub_service_name) LIKE '%repayment%' THEN -1 * txn_value_num
+            WHEN service_name IN ('P2P On-net', 'P2P Off-net', 'Remittance Inbound', 'Payment/Collection', 'MoPesa')
+                 AND lower(sub_service_name) NOT LIKE '%disbursement%'
+                 AND lower(sub_service_name) NOT LIKE '%repayment%'
+                THEN txn_value_num
+            WHEN service_name IN ('Cash Out', 'Remittance Outbound', 'Airtime', 'Bundles', 'Momo Pay Merchants', 'Debit/Merchant')
+                 AND lower(sub_service_name) NOT LIKE '%disbursement%'
+                 AND lower(sub_service_name) NOT LIKE '%repayment%'
+                THEN -1 * txn_value_num
+            ELSE 0.0
+        END AS signed_amount
+    FROM raw_base
 )
 SELECT *
 FROM base_events
