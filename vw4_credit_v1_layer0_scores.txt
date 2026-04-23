@@ -1,0 +1,122 @@
+WITH layer1 AS (
+    SELECT *
+    FROM your_layer1_feature_view
+),
+layer0_rules AS (
+    SELECT
+        feature_dt,
+        subscriber_msisdn,
+
+        loan_disb_amt_30d,
+        loan_repaid_amt_30d,
+        wallet_inflow_amt_30d,
+        wallet_outflow_amt_30d,
+        spend_amt_30d,
+        disb_cnt_30d,
+        repay_cnt_30d,
+        wallet_txn_cnt_30d,
+        active_lender_cnt_30d,
+        alt_credit_active_flag_30d,
+        wallet_active_days_30d,
+        days_since_last_disbursement,
+        days_since_last_repayment,
+        outstanding_exposure_amt_30d,
+        repayment_ratio_30d,
+        exposure_to_inflow_ratio_30d,
+        stacked_borrowing_flag_30d,
+        repeated_borrowing_flag_30d,
+
+        CASE
+            WHEN repayment_ratio_30d >= 0.80
+                 AND exposure_to_inflow_ratio_30d < 0.30
+                 AND stacked_borrowing_flag_30d = 0 THEN 0.90
+            WHEN repayment_ratio_30d >= 0.50
+                 AND exposure_to_inflow_ratio_30d < 0.60 THEN 0.70
+            WHEN repayment_ratio_30d > 0 THEN 0.45
+            ELSE 0.20
+        END AS expected_repayment_probability_v1_rule,
+
+        CASE
+            WHEN exposure_to_inflow_ratio_30d >= 1.00
+                 OR stacked_borrowing_flag_30d = 1 THEN 0.70
+            WHEN exposure_to_inflow_ratio_30d >= 0.60 THEN 0.45
+            ELSE 0.15
+        END AS expected_credit_loss_rate_v1_rule,
+
+        CASE
+            WHEN wallet_active_days_30d <= 2
+                 AND days_since_last_disbursement <= 7 THEN 0.80
+            WHEN wallet_active_days_30d <= 5 THEN 0.60
+            ELSE 0.20
+        END AS churn_cooling_probability_v1_rule,
+
+        CASE
+            WHEN wallet_inflow_amt_30d + spend_amt_30d >= 100000 THEN 0.90
+            WHEN wallet_inflow_amt_30d + spend_amt_30d >= 30000 THEN 0.60
+            ELSE 0.25
+        END AS expected_future_transaction_margin_score_v1_rule,
+
+        CASE
+            WHEN stacked_borrowing_flag_30d = 1
+                 OR days_since_last_repayment > 14 THEN 0.60
+            WHEN repeated_borrowing_flag_30d = 1 THEN 0.40
+            ELSE 0.15
+        END AS expected_treatment_cost_score_v1_rule,
+
+        LEAST(
+            100,
+            25 * CASE WHEN exposure_to_inflow_ratio_30d >= 1.00 THEN 1 ELSE 0 END +
+            20 * CASE WHEN stacked_borrowing_flag_30d = 1 THEN 1 ELSE 0 END +
+            20 * CASE WHEN repeated_borrowing_flag_30d = 1 THEN 1 ELSE 0 END +
+            20 * CASE WHEN repayment_ratio_30d < 0.50 THEN 1 ELSE 0 END +
+            15 * CASE WHEN wallet_active_days_30d <= 3 THEN 1 ELSE 0 END
+        ) AS debt_stress_index_v1,
+
+        CASE
+            WHEN stacked_borrowing_flag_30d = 1 AND repeated_borrowing_flag_30d = 1 THEN 0.80
+            WHEN stacked_borrowing_flag_30d = 1 THEN 0.60
+            WHEN alt_credit_active_flag_30d = 1 THEN 0.40
+            ELSE 0.10
+        END AS fraud_abuse_risk_score_v1_rule,
+
+        CASE
+            WHEN wallet_active_days_30d >= 10
+                 AND wallet_inflow_amt_30d > 0
+                 AND spend_amt_30d > 0 THEN 0.85
+            WHEN wallet_active_days_30d >= 5 THEN 0.60
+            ELSE 0.25
+        END AS behavior_consistency_score_v1_rule,
+
+        CASE
+            WHEN subscriber_msisdn IS NOT NULL THEN 1.00
+            ELSE 0.50
+        END AS identity_confidence_score_v1_rule
+    FROM layer1
+)
+SELECT
+    feature_dt,
+    subscriber_msisdn,
+    expected_repayment_probability_v1_rule,
+    expected_credit_loss_rate_v1_rule,
+    churn_cooling_probability_v1_rule,
+    expected_future_transaction_margin_score_v1_rule,
+    expected_treatment_cost_score_v1_rule,
+    debt_stress_index_v1,
+    fraud_abuse_risk_score_v1_rule,
+    behavior_consistency_score_v1_rule,
+    identity_confidence_score_v1_rule,
+    CASE
+        WHEN debt_stress_index_v1 >= 80 THEN 0.80 ELSE 0.10
+    END AS prob_distressed_v1_rule,
+    CASE
+        WHEN debt_stress_index_v1 BETWEEN 60 AND 79 THEN 0.70 ELSE 0.15
+    END AS prob_at_risk_v1_rule,
+    CASE
+        WHEN churn_cooling_probability_v1_rule >= 0.70 THEN 0.75 ELSE 0.10
+    END AS prob_cooling_off_v1_rule,
+    CASE
+        WHEN expected_repayment_probability_v1_rule >= 0.80
+             AND debt_stress_index_v1 < 40 THEN 0.80
+        ELSE 0.20
+    END AS prob_healthy_v1_rule
+FROM layer0_rules;

@@ -1,0 +1,5 @@
+SELECT DISTINCT service_name
+FROM analytics.momo_tran_loc_mapping_v2
+where sub_service_name not like '%Repayment%'
+and lower(sub_service_name) not LIKE '%disbursement%'
+and date_key between 20260401 AND 20260402

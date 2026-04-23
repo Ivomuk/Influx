@@ -1,0 +1,17 @@
+Remittance Outbound
+Clinic Pesa
+P2P Off-net
+Cash Out
+Airtime
+Mokash
+Momo Pay Merchants
+Payment/Collection
+Bundles
+P2P On-net
+MoMo advance
+Fees from Airtime reversals
+Remittance Inbound
+XENO
+Debit/Merchant
+MoPesa
+Xtrafloat

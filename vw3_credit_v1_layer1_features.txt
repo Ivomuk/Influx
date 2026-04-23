@@ -1,0 +1,158 @@
+WITH subscriber_day AS (
+    SELECT
+        event_dt,
+        subscriber_msisdn,
+        SUM(disbursement_amt) AS loan_disb_amt_day,
+        SUM(repayment_amt) AS loan_repaid_amt_day,
+        SUM(wallet_inflow_amt) AS wallet_inflow_amt_day,
+        SUM(wallet_outflow_amt) AS wallet_outflow_amt_day,
+        SUM(spend_amt) AS spend_amt_day,
+        COUNT_IF(event_family = 'loan_disbursement') AS disb_cnt_day,
+        COUNT_IF(event_family = 'loan_repayment') AS repay_cnt_day,
+        COUNT_IF(event_family IN ('wallet_inflow', 'wallet_outflow', 'spend_behavior')) AS wallet_txn_cnt_day,
+        COUNT(DISTINCT CASE
+            WHEN event_family IN ('loan_disbursement', 'loan_repayment') THEN lender_family_v1
+            ELSE NULL
+        END) AS active_lender_cnt_day,
+        MAX(CASE WHEN alt_credit_signal_flag = 1 THEN 1 ELSE 0 END) AS alt_credit_active_flag_day
+    FROM (
+        SELECT
+            CAST(date_parse(CAST(date_key AS varchar), '%Y%m%d') AS date) AS event_dt,
+            CASE
+                WHEN lower(sub_service_name) LIKE '%disbursement%' THEN to_msisdn
+                WHEN lower(sub_service_name) LIKE '%repayment%' THEN from_msisdn
+                WHEN service_name IN ('P2P On-net', 'P2P Off-net', 'Remittance Inbound', 'Payment/Collection', 'MoPesa')
+                    THEN to_msisdn
+                WHEN service_name IN ('Cash Out', 'Remittance Outbound')
+                    THEN from_msisdn
+                WHEN service_name IN ('Airtime', 'Bundles', 'Momo Pay Merchants', 'Debit/Merchant')
+                    THEN from_msisdn
+                WHEN service_name IN ('Mokash', 'MoMo advance', 'Xtrafloat', 'XtraCash', 'Jumo')
+                    THEN COALESCE(to_msisdn, from_msisdn)
+                ELSE COALESCE(to_msisdn, from_msisdn)
+            END AS subscriber_msisdn,
+            CASE
+                WHEN lower(sub_service_name) LIKE '%disbursement%' THEN service_name
+                WHEN lower(sub_service_name) LIKE '%repayment%' THEN service_name
+                WHEN service_name IN ('Mokash', 'MoMo advance', 'Xtrafloat', 'XtraCash', 'Jumo')
+                    THEN service_name
+                ELSE NULL
+            END AS lender_family_v1,
+            CASE WHEN lower(sub_service_name) LIKE '%disbursement%' THEN CAST(replace(CAST(txn_value AS varchar), ',', '') AS double) ELSE 0.0 END AS disbursement_amt,
+            CASE WHEN lower(sub_service_name) LIKE '%repayment%' THEN CAST(replace(CAST(txn_value AS varchar), ',', '') AS double) ELSE 0.0 END AS repayment_amt,
+            CASE
+                WHEN service_name IN ('P2P On-net', 'P2P Off-net', 'Remittance Inbound', 'Payment/Collection', 'MoPesa')
+                     AND lower(sub_service_name) NOT LIKE '%disbursement%'
+                     AND lower(sub_service_name) NOT LIKE '%repayment%'
+                    THEN CAST(replace(CAST(txn_value AS varchar), ',', '') AS double)
+                ELSE 0.0
+            END AS wallet_inflow_amt,
+            CASE
+                WHEN service_name IN ('Cash Out', 'Remittance Outbound')
+                     AND lower(sub_service_name) NOT LIKE '%disbursement%'
+                     AND lower(sub_service_name) NOT LIKE '%repayment%'
+                    THEN CAST(replace(CAST(txn_value AS varchar), ',', '') AS double)
+                ELSE 0.0
+            END AS wallet_outflow_amt,
+            CASE
+                WHEN service_name IN ('Airtime', 'Bundles', 'Momo Pay Merchants', 'Debit/Merchant')
+                     AND lower(sub_service_name) NOT LIKE '%disbursement%'
+                     AND lower(sub_service_name) NOT LIKE '%repayment%'
+                    THEN CAST(replace(CAST(txn_value AS varchar), ',', '') AS double)
+                ELSE 0.0
+            END AS spend_amt,
+            CASE
+                WHEN service_name IN ('Mokash', 'MoMo advance', 'Xtrafloat', 'XtraCash', 'Jumo')
+                     AND lower(sub_service_name) NOT LIKE '%disbursement%'
+                     AND lower(sub_service_name) NOT LIKE '%repayment%'
+                    THEN 1
+                ELSE 0
+            END AS alt_credit_signal_flag,
+            CASE
+                WHEN lower(sub_service_name) LIKE '%disbursement%' THEN 'loan_disbursement'
+                WHEN lower(sub_service_name) LIKE '%repayment%' THEN 'loan_repayment'
+                WHEN service_name IN ('P2P On-net', 'P2P Off-net', 'Remittance Inbound', 'Payment/Collection', 'MoPesa')
+                    THEN 'wallet_inflow'
+                WHEN service_name IN ('Cash Out', 'Remittance Outbound')
+                    THEN 'wallet_outflow'
+                WHEN service_name IN ('Airtime', 'Bundles', 'Momo Pay Merchants', 'Debit/Merchant')
+                    THEN 'spend_behavior'
+                WHEN service_name IN ('Mokash', 'MoMo advance', 'Xtrafloat', 'XtraCash', 'Jumo')
+                    THEN 'alt_credit_signal'
+                ELSE 'other_non_loan'
+            END AS event_family
+        FROM analytics.momo_tran_loc_mapping_v2
+        WHERE date_key BETWEEN 20260301 AND 20260430
+    ) t
+    WHERE subscriber_msisdn IS NOT NULL
+    GROUP BY 1, 2
+),
+layer1_features AS (
+    SELECT
+        a.event_dt AS feature_dt,
+        a.subscriber_msisdn,
+
+        SUM(b.loan_disb_amt_day) AS loan_disb_amt_30d,
+        SUM(b.loan_repaid_amt_day) AS loan_repaid_amt_30d,
+        SUM(b.wallet_inflow_amt_day) AS wallet_inflow_amt_30d,
+        SUM(b.wallet_outflow_amt_day) AS wallet_outflow_amt_30d,
+        SUM(b.spend_amt_day) AS spend_amt_30d,
+
+        SUM(b.disb_cnt_day) AS disb_cnt_30d,
+        SUM(b.repay_cnt_day) AS repay_cnt_30d,
+        SUM(b.wallet_txn_cnt_day) AS wallet_txn_cnt_30d,
+
+        MAX(b.active_lender_cnt_day) AS active_lender_cnt_30d,
+        MAX(b.alt_credit_active_flag_day) AS alt_credit_active_flag_30d,
+
+        COUNT(DISTINCT b.event_dt) FILTER (WHERE b.wallet_txn_cnt_day > 0) AS wallet_active_days_30d,
+
+        DATE_DIFF(
+            'day',
+            MAX(CASE WHEN b.disb_cnt_day > 0 THEN b.event_dt ELSE NULL END),
+            a.event_dt
+        ) AS days_since_last_disbursement,
+
+        DATE_DIFF(
+            'day',
+            MAX(CASE WHEN b.repay_cnt_day > 0 THEN b.event_dt ELSE NULL END),
+            a.event_dt
+        ) AS days_since_last_repayment
+    FROM subscriber_day a
+    JOIN subscriber_day b
+        ON a.subscriber_msisdn = b.subscriber_msisdn
+       AND b.event_dt BETWEEN date_add('day', -29, a.event_dt) AND a.event_dt
+    GROUP BY 1, 2
+)
+SELECT
+    feature_dt,
+    subscriber_msisdn,
+    loan_disb_amt_30d,
+    loan_repaid_amt_30d,
+    wallet_inflow_amt_30d,
+    wallet_outflow_amt_30d,
+    spend_amt_30d,
+    disb_cnt_30d,
+    repay_cnt_30d,
+    wallet_txn_cnt_30d,
+    active_lender_cnt_30d,
+    alt_credit_active_flag_30d,
+    wallet_active_days_30d,
+    COALESCE(days_since_last_disbursement, 9999) AS days_since_last_disbursement,
+    COALESCE(days_since_last_repayment, 9999) AS days_since_last_repayment,
+    GREATEST(loan_disb_amt_30d - loan_repaid_amt_30d, 0.0) AS outstanding_exposure_amt_30d,
+    CASE
+        WHEN loan_disb_amt_30d > 0 THEN loan_repaid_amt_30d / loan_disb_amt_30d
+        ELSE 0.0
+    END AS repayment_ratio_30d,
+    CASE
+        WHEN wallet_inflow_amt_30d > 0 THEN GREATEST(loan_disb_amt_30d - loan_repaid_amt_30d, 0.0) / wallet_inflow_amt_30d
+        ELSE 999.0
+    END AS exposure_to_inflow_ratio_30d,
+    CASE
+        WHEN active_lender_cnt_30d >= 2 THEN 1 ELSE 0
+    END AS stacked_borrowing_flag_30d,
+    CASE
+        WHEN disb_cnt_30d >= 3 THEN 1 ELSE 0
+    END AS repeated_borrowing_flag_30d
+FROM layer1_features;
