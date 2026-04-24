@@ -1,0 +1,165 @@
+
+
+
+CREATE OR REPLACE VIEW vw1_credit_v1_normalized_events AS
+WITH raw_base AS (
+    SELECT
+        CAST(date_parse(CAST(date_key AS varchar), '%Y%m%d') AS date) AS event_dt,
+        inserted_dt,
+        fid,
+        service_name,
+        sub_service_name,
+        instruct_hdr_type,
+        from_msisdn,
+        to_msisdn,
+        CAST(replace(CAST(txn_value AS varchar), ',', '') AS double) AS txn_value_num,
+        from_profile,
+        to_profile,
+        from_sp,
+        to_sp
+    FROM analytics.momo_tran_loc_mapping_v2
+    WHERE date_key BETWEEN 20260401 AND 20260430
+),
+base_events AS (
+    SELECT
+        event_dt,
+        inserted_dt,
+        fid,
+        service_name,
+        sub_service_name,
+        instruct_hdr_type,
+        from_msisdn,
+        to_msisdn,
+        txn_value_num,
+        from_profile,
+        to_profile,
+        from_sp,
+        to_sp,
+
+        CASE
+            WHEN lower(sub_service_name) LIKE '%disbursement%' THEN 'loan_disbursement'
+            WHEN lower(sub_service_name) LIKE '%repayment%' THEN 'loan_repayment'
+            WHEN service_name IN ('P2P On-net', 'P2P Off-net', 'Remittance Inbound', 'Payment/Collection', 'MoPesa')
+                THEN 'wallet_inflow'
+            WHEN service_name IN ('Cash Out', 'Remittance Outbound')
+                THEN 'wallet_outflow'
+            WHEN service_name IN ('Airtime', 'Bundles', 'Momo Pay Merchants', 'Debit/Merchant')
+                THEN 'spend_behavior'
+            WHEN service_name IN ('Mokash', 'MoMo advance', 'Xtrafloat', 'XtraCash', 'Jumo')
+                THEN 'alt_credit_signal'
+            ELSE 'other_non_loan'
+        END AS event_family,
+
+        CASE
+            WHEN lower(sub_service_name) LIKE '%disbursement%' THEN to_msisdn
+            WHEN lower(sub_service_name) LIKE '%repayment%' THEN from_msisdn
+            WHEN service_name IN ('P2P On-net', 'P2P Off-net', 'Remittance Inbound', 'Payment/Collection', 'MoPesa')
+                THEN to_msisdn
+            WHEN service_name IN ('Cash Out', 'Remittance Outbound')
+                THEN from_msisdn
+            WHEN service_name IN ('Airtime', 'Bundles', 'Momo Pay Merchants', 'Debit/Merchant')
+                THEN from_msisdn
+            WHEN service_name IN ('Mokash', 'MoMo advance', 'Xtrafloat', 'XtraCash', 'Jumo')
+                THEN COALESCE(to_msisdn, from_msisdn)
+            ELSE COALESCE(to_msisdn, from_msisdn)
+        END AS subscriber_msisdn,
+
+        CASE
+            WHEN lower(sub_service_name) LIKE '%disbursement%' THEN from_msisdn
+            WHEN lower(sub_service_name) LIKE '%repayment%' THEN to_msisdn
+            ELSE NULL
+        END AS loan_counterparty_msisdn,
+
+        CASE
+            WHEN lower(sub_service_name) LIKE '%disbursement%' THEN service_name
+            WHEN lower(sub_service_name) LIKE '%repayment%' THEN service_name
+            WHEN service_name IN ('Mokash', 'MoMo advance', 'Xtrafloat', 'XtraCash', 'Jumo')
+                THEN service_name
+            ELSE NULL
+        END AS lender_family_v1,
+
+        CASE
+            WHEN lower(sub_service_name) LIKE '%disbursement%' THEN txn_value_num
+            ELSE 0.0
+        END AS disbursement_amt,
+
+        CASE
+            WHEN lower(sub_service_name) LIKE '%repayment%' THEN txn_value_num
+            ELSE 0.0
+        END AS repayment_amt,
+
+        CASE
+            WHEN service_name IN ('P2P On-net', 'P2P Off-net', 'Remittance Inbound', 'Payment/Collection', 'MoPesa')
+                 AND lower(sub_service_name) NOT LIKE '%disbursement%'
+                 AND lower(sub_service_name) NOT LIKE '%repayment%'
+                THEN txn_value_num
+            ELSE 0.0
+        END AS wallet_inflow_amt,
+
+        CASE
+            WHEN service_name IN ('Cash Out', 'Remittance Outbound')
+                 AND lower(sub_service_name) NOT LIKE '%disbursement%'
+                 AND lower(sub_service_name) NOT LIKE '%repayment%'
+                THEN txn_value_num
+            ELSE 0.0
+        END AS wallet_outflow_amt,
+
+        CASE
+            WHEN service_name IN ('Airtime', 'Bundles', 'Momo Pay Merchants', 'Debit/Merchant')
+                 AND lower(sub_service_name) NOT LIKE '%disbursement%'
+                 AND lower(sub_service_name) NOT LIKE '%repayment%'
+                THEN txn_value_num
+            ELSE 0.0
+        END AS spend_amt,
+
+        CASE
+            WHEN service_name IN ('Mokash', 'MoMo advance', 'Xtrafloat', 'XtraCash', 'Jumo')
+                 AND lower(sub_service_name) NOT LIKE '%disbursement%'
+                 AND lower(sub_service_name) NOT LIKE '%repayment%'
+                THEN 1
+            ELSE 0
+        END AS alt_credit_signal_flag,
+
+        CASE
+            WHEN lower(sub_service_name) LIKE '%disbursement%' THEN txn_value_num
+            WHEN lower(sub_service_name) LIKE '%repayment%' THEN -1 * txn_value_num
+            WHEN service_name IN ('P2P On-net', 'P2P Off-net', 'Remittance Inbound', 'Payment/Collection', 'MoPesa')
+                 AND lower(sub_service_name) NOT LIKE '%disbursement%'
+                 AND lower(sub_service_name) NOT LIKE '%repayment%'
+                THEN txn_value_num
+            WHEN service_name IN ('Cash Out', 'Remittance Outbound', 'Airtime', 'Bundles', 'Momo Pay Merchants', 'Debit/Merchant')
+                 AND lower(sub_service_name) NOT LIKE '%disbursement%'
+                 AND lower(sub_service_name) NOT LIKE '%repayment%'
+                THEN -1 * txn_value_num
+            ELSE 0.0
+        END AS signed_amount
+    FROM raw_base
+)
+SELECT
+    event_dt,
+    inserted_dt,
+    fid,
+    service_name,
+    sub_service_name,
+    instruct_hdr_type,
+    from_msisdn,
+    to_msisdn,
+    txn_value_num,
+    from_profile,
+    to_profile,
+    from_sp,
+    to_sp,
+    event_family,
+    subscriber_msisdn,
+    loan_counterparty_msisdn,
+    lender_family_v1,
+    disbursement_amt,
+    repayment_amt,
+    wallet_inflow_amt,
+    wallet_outflow_amt,
+    spend_amt,
+    alt_credit_signal_flag,
+    signed_amount
+FROM base_events
+WHERE subscriber_msisdn IS NOT NULL
+;
