@@ -1,0 +1,5 @@
+engine_outputs = run_credit_v1_decision_engine(layer1_df, layer0_df)
+
+engine_outputs['vw7_credit_v1_policy_prefilter']
+engine_outputs['vw8_credit_v1_tnv_action_evaluation']
+engine_outputs['vw9_credit_v1_final_capacity_output']
