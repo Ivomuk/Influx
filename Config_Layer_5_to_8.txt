@@ -1,0 +1,48 @@
+# Build reusable modules for Layer 5 to Layer 8 on top of the in-memory decision-engine outputs.
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+
+tqdm.pandas()
+
+STATE_ENGINE_CONFIG = {
+    'healthy_dsi_max': 35.0,
+    'at_risk_dsi_min': 36.0,
+    'at_risk_dsi_max': 59.0,
+    'distressed_dsi_min': 60.0,
+    'cooling_churn_threshold': 0.65,
+    'recovered_repayment_min': 0.75,
+    'recovered_dsi_max': 45.0,
+    'fraud_review_threshold': 0.80,
+    'restricted_actions': ['DECLINE', 'RESTRICT'],
+    'minimum_persistence_days_default': 7,
+    'minimum_persistence_days_restricted': 14,
+    'minimum_persistence_days_fraud_review': 14
+}
+
+INTERVENTION_CONFIG = {
+    'wallet_drop_threshold': 0.40,
+    'dsi_rise_threshold': 15.0,
+    'missed_repayment_threshold': 0.25,
+    'repeat_borrowing_flag_value': 1,
+    'cooling_pattern_threshold': 0.65,
+    'recovery_probability_min': 0.70
+}
+
+PORTFOLIO_CONFIG = {
+    'high_restrict_rate_threshold': 0.35,
+    'high_distressed_rate_threshold': 0.25,
+    'high_fraud_review_rate_threshold': 0.05,
+    'high_exposure_concentration_threshold': 0.40,
+    'high_stacked_borrowing_rate_threshold': 0.20
+}
+
+GOVERNANCE_CONFIG = {
+    'decision_engine_version': 'credit_v1_python_decision_engine_prod',
+    'state_engine_version': 'credit_v1_state_engine_v1',
+    'oversight_queue_roles': 'risk_ops,collections_ops,governance_manager',
+    'manual_review_trigger_actions': 'RESTRICT,FRAUD_REVIEW,HIGH_VALUE_EDGE_CASE'
+}
+
+print(pd.Series(STATE_ENGINE_CONFIG))
+print(pd.Series(INTERVENTION_CONFIG))
