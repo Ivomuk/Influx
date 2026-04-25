@@ -1,5 +1,4 @@
-1.Lender submits report (disbursements / repayments / defaults)
-
+1. SQL Batch Pipeline (runs daily via orchestrator.txt)
 
 Raw MoMo Transactions
         │
@@ -10,39 +9,78 @@ vw1_credit_v1_normalized_events
   Signs the amount and resolves subscriber_msisdn
         │
         ▼
+[QA gate: qa_vw1_credit_v1_*.txt — 4 checks: duplicates, invalid MSISDNs,
+          service-family coverage, signed-amount direction]
+        │
+        ▼
 vw2_credit_v1_subscriber_day
   Rolls events up to one row per subscriber per day
-  (daily amounts, counts, flags)
+  (daily amounts, counts, binary flags)
         │
         ▼
-vw3_credit_v1_layer1_features   ← Dimension 2 + 5
+[QA gate: qa_vw2_credit_v1_subscriber_day.txt — 6 checks: duplicates,
+          negative amounts, negative counts, binary flags, disbursement
+          count/amount mismatch, future event_dt]
+        │
+        ▼
+vw3_credit_v1_layer1_features
   Computes 7d / 14d / 30d / 60d / 90d rolling windows
   Anti-gaming flags: timing_manipulation, suspicious_repayment_jump, loan_cycling
-  Identity maturity: sim_age_days, sim_age_cohort, has_inflow_and_spend_flag
+  Identity maturity: sim_age_days, sim_age_cohort (mature/developing/thin),
+                     has_inflow_and_spend_flag
         │
         ▼
-vw4_credit_v1_layer0_scores     ← Dimension 2 + 5
-  Deterministic rule-based scoring (placeholder for future ML)
+[QA gate: qa_vw3_credit_v1_layer1_features.txt — 8 checks: repayment ratios
+          in [0,1], anti-gaming flags in {0,1}, negative exposure, active-days
+          bounds, negative sim_age_days, invalid sim_age_cohort,
+          identity_confidence_score in [0,1], duplicates]
+        │
+        ▼
+vw4_credit_v1_layer0_scores
+  Deterministic rule-based scoring (10 scores per subscriber)
   Outputs: expected_repayment_probability, expected_credit_loss_rate,
            churn_cooling_probability, expected_future_transaction_margin_score,
-           debt_stress_index_v1, fraud_abuse_risk_score, behavior_consistency_score,
-           identity_confidence_score, customer_lifetime_value_contribution
+           expected_treatment_cost_score,
+           customer_lifetime_value_contribution (derived from 3 scores above),
+           debt_stress_index_v1, fraud_abuse_risk_score,
+           behavior_consistency_score, identity_confidence_score
+        │
+        ▼
+[QA gate: qa_vw4_credit_v1_layer0_scores.txt — 7 checks: all 10 scores in
+          valid range, DSI in [0,100], NULL scores, CLV formula sanity,
+          anti-gaming flag pass-through integrity, duplicates,
+          vw3→vw4 join coverage]
+        │
+        ├──▶ vw5_credit_v1_reason_codes
+        │      Per-subscriber primary_reason_code computed in SQL
+        │      Priority-ordered: 9 conditions → one authoritative reason code
+        │      (Consumed by build_policy_prefilter to override Python np.select)
+        │
+        └──▶ vw6_credit_v1_cap_and_action
+               Per-subscriber conservative_credit_limit_v1 and recommended_action
+               (Consumed by select_final_capacity_output as hard per-subscriber ceiling)
 
 
 2. Decision Engine (Python, Layers 2–4)
 
-layer1_df + layer0_df
+layer1_df + layer0_df + vw5_reason_codes_df + vw6_cap_action_df
+                      + circuit_breaker_multiplier (from prior portfolio run)
+        │
+        ▼
+run_credit_v1_decision_engine(circuit_breaker_multiplier)
+  Scales policy_capacity_cap by multiplier before any subscriber evaluation
         │
         ▼
 prepare_decision_base
   Validates required columns, coerces types, inner-joins L1 + L0
         │
         ▼
-build_policy_prefilter          ← Dimension 4 + 5
+build_policy_prefilter(vw5_reason_codes_df)
   Computes exposure_to_inflow_ratio, thin_file_flag, recent_disbursement_no_repayment_flag
   Anti-gaming blocks: timing_manipulation_flag, loan_cycling_flag → policy_restrict_flag
   Sets feasible_action_set per subscriber (which actions are allowed)
-  Sets primary_policy_reason (first matching reason code)
+  Sets primary_policy_reason from Python np.select, then overrides with vw5
+  reason code where vw5 has a non-ELIGIBLE_BASELINE code (SQL audit trail wins)
         │
         ▼
 evaluate_tnv_actions
@@ -54,14 +92,23 @@ evaluate_tnv_actions
                  − Expected Treatment Cost
         │
         ▼
-select_final_capacity_output    ← Dimension 4
+select_final_capacity_output(vw6_cap_action_df)
   Picks highest-TNV feasible action per subscriber
-  Applies policy_capacity_cap (hard ceiling)
+  Applies policy_capacity_cap (hard ceiling, already scaled by circuit breaker)
   Applies stability_multiplier (action-level smoothing)
   Applies stability smoothing: bounds delta from previous cycle
     (max +25% increase / max −40% decrease per run)
-  Optional: network-wide budget constraint (disabled by default)
+  Applies vw6 conservative_credit_limit_v1 as hard per-subscriber ceiling
+    (np.minimum after all other computation)
   Outputs: selected_action, CreditLimit, decision_status, prev_credit_limit
+
+        │
+        ▼
+[QA gate: qa_decision_engine_output.txt — 10 checks: negative CreditLimit,
+          exceeds policy_cap, invalid selected_action, invalid decision_status,
+          duplicate MSISDNs, DECLINE/RESTRICT with nonzero limit,
+          stability bounds violated, invalid primary_policy_reason,
+          invalid policy_restrict_flag, empty feasible_action_set]
 
 
 3. State, Intervention, Portfolio, Governance (Layers 5–8)
@@ -69,7 +116,7 @@ select_final_capacity_output    ← Dimension 4
 policy_prefilter_df + final_capacity_df
         │
         ▼
-build_customer_state_df         ← Dimension 4
+build_customer_state_df
   Assigns: Healthy / At Risk / Distressed / Cooling Off / Recovered / Restricted / Fraud Review
   Persistence enforcement: blocks upward state transitions until minimum days elapsed
   Tracks state_change_dt for next cycle
@@ -80,7 +127,7 @@ build_intervention_df
   Sets intervention_action per subscriber
         │
         ▼
-build_portfolio_monitor_df      ← Dimension 4
+build_portfolio_monitor_df
   Computes portfolio-level: restrict_rate, distressed_rate, fraud_review_rate,
                              stacked_borrowing_rate, exposure_concentration
   Emits portfolio_control_signal:
@@ -90,7 +137,7 @@ build_portfolio_monitor_df      ← Dimension 4
     DISTRESS_POSTURE_TIGHTENING → 0.70
     FRAUD_PRESSURE_TIGHTENING → 0.65
     SYSTEM_WIDE_TIGHTENING → 0.60
-  circuit_breaker_capacity_multiplier fed back to next decision run
+  circuit_breaker_capacity_multiplier persisted → fed to next batch run
         │
         ▼
 build_governance_log_df
@@ -98,7 +145,47 @@ build_governance_log_df
   Records persistence_block_applied, prev_credit_limit, audit_trigger_flag
 
 
-4. Lender Feedback Loop (Dimension 6, event-driven)
+4. Feature Store Bootstrap + Real-Time Eligibility API (Dimension 3)
+
+final_capacity_df + layer1_df + layer0_df
+        │
+        ▼
+dim3_feature_store: load_from_batch_output
+  Writes merged L1+L0 to cold path (daily batch)
+  Also bootstraps hot path so first API calls don't miss
+  Hot path max age: 15 min | Warm path max age: 30 min | Graceful degradation: 60 min
+
+Lender calls check_eligibility(msisdn)  [dim3_eligibility_api]
+        │
+        ▼
+Feature Store read (hot → warm → cold, <5ms target)
+  If stale (>15 min): is_stale=True, still served
+  If missing: return CreditLimit=0, decision_status=NO_DATA
+        │
+        ▼
+_run_single_subscriber_decision
+  Runs full Layer 2–4 engine on single subscriber's features
+  If engine errors: return CreditLimit=0, decision_status=ENGINE_ERROR
+        │
+        ▼
+EligibilityResponse (external-safe fields only)
+  MSISDN, CreditLimit, validity_period_days, decision_timestamp,
+  policy_version, decision_status, is_stale, latency_ms
+  (no scores, states, or reason codes exposed)
+  p99 latency target: <200ms
+
+        │
+        ▼
+[QA gate: qa_api_output_contract.txt — 12 checks:
+  EligibilityResponse (7): negative CreditLimit, invalid decision_status,
+    is_stale outside {0,1}, validity_days ≤ 0, latency SLA breach,
+    duplicate MSISDN, NO_DATA with nonzero limit
+  State transitions (5): invalid operating_state, persistence_block outside {0,1},
+    state_change_dt in future, duplicate (feature_dt, subscriber_msisdn),
+    block-without-prior-state]
+
+
+5. Lender Feedback Loop (Dimension 6, event-driven)
 
 Lender submits report (disbursements / repayments / defaults)
         │
@@ -116,32 +203,10 @@ ingest_lender_report
         │
         ├──▶ compute_near_realtime_exposure_update
         │      Updates outstanding_exposure_amt immediately
-        │      Writes to warm path of feature store
+        │      Writes to warm path of feature store (freshness < 30 min)
         │
         └──▶ detect_lender_noncompliance
                Flags LENT_TO_RESTRICTED_SUBSCRIBER or EXCEEDED_CREDIT_LIMIT
-
-
-5. Real-Time Eligibility API (Dimension 3, request-driven)
-
-Lender calls check_eligibility(msisdn)
-        │
-        ▼
-Feature Store read (hot → warm → cold, <5ms target)
-  If stale (>15min): is_stale=True, still served
-  If missing: return CreditLimit=0, decision_status=NO_DATA
-        │
-        ▼
-_run_single_subscriber_decision
-  Runs full Layer 2–4 engine on single subscriber's features
-  If engine errors: return CreditLimit=0, decision_status=ENGINE_ERROR
-        │
-        ▼
-EligibilityResponse (external-safe fields only)
-  MSISDN, CreditLimit, validity_period_days, decision_timestamp,
-  policy_version, decision_status, is_stale, latency_ms
-  (no scores, states, or reason codes exposed)
-  p99 latency target: <200ms
 
 
 6. Outcome Tracking (Dimension 6, runs after each batch)
@@ -181,3 +246,28 @@ final_capacity_df
 build_external_lender_interface
   Strips all internal fields (scores, states, reason codes, TNV components)
   Exposes only: MSISDN + CreditLimit (+ optional metadata if configured)
+        │
+        ▼
+Lenders
+
+
+8. Orchestration (orchestrator.txt)
+
+Wires all of the above into a single batch DAG with dependency ordering:
+  vw1 → vw2 → vw3 → vw4 → vw5 → vw6
+  → SQL QA gates
+  → decision engine (receives vw5, vw6, circuit_breaker_multiplier)
+  → Python QA gate
+  → layers 5–8 (emits new circuit_breaker_multiplier)
+  → feature store bootstrap
+  → outcome tracking
+  → external lender interface
+
+Cross-cycle state persisted between runs:
+  previous_capacity_df        — stability smoothing (max ±25%/40% delta)
+  prior_state_df              — persistence enforcement (blocks early state reversal)
+  circuit_breaker_multiplier  — portfolio feedback (scales policy_capacity_cap)
+
+Near-realtime handler: handle_lender_feedback_event()
+  Calls feedback pipeline then writes to warm feature store path immediately
+  Ensures eligibility API sees updated exposure within 30 min of lender report

@@ -1,12 +1,11 @@
 1. Reference Data (inputs to vw1)
 
-File	Role
-loan_related_services_list.txt	The list of sub_service_names that classify as loan events (MoPesa, XtraCash, Jumo, Mokash, MoMo Advance). Used as the lookup 				that drives event_family assignment in vw1.
-Transactions_types_list.txt	Full catalogue of 17 MoMo service types. Used to understand which service families exist and ensure vw1 covers all of them.
-Repayments.txt			Sample repayment transaction rows — input data that flows into vw1
-disbursement.txt		Sample disbursement transaction rows — input data that flows into vw1
-Transactions.txt		Sample non-loan transaction rows (P2P, Airtime) — also input to vw1
-
+File					Role
+loan_related_services_list.txt		The list of sub_service_names that classify as loan events (MoPesa, XtraCash, Jumo, Mokash, MoMo Advance). Used as the lookup that drives event_family assignment in vw1.
+Transactions_types_list.txt		Full catalogue of 17 MoMo service types. Used to understand which service families exist and ensure vw1 covers all of them.
+Repayments.txt				Sample repayment transaction rows — input data that flows into vw1
+disbursement.txt			Sample disbursement transaction rows — input data that flows into vw1
+Transactions.txt			Sample non-loan transaction rows (P2P, Airtime) — also input to vw1
 
 
 Batch SQL Pipeline
@@ -15,29 +14,33 @@ Raw Transactions
       │
       ▼
 
+File							Layer					What it does
+vw1_credit_v1_normalized_events.txt			Layer 1 — event classification		Maps every raw transaction to event_family, resolves subscriber_msisdn, computes signed_amount
+qa_vw1_credit_v1_duplicate_fid.txt			QA on vw1				Detects duplicate financial_id records
+qa_vw1_credit_v1_invalid_subscriber_msisdn.txt		QA on vw1				Flags null or malformed MSISDNs
+qa_vw1_credit_v1_service_family_mapping_coverage.txt	QA on vw1				Checks all service types are mapped to a family
+qa_vw1_credit_v1_signed_amount_sanity.txt		QA on vw1				Validates signed amounts are directionally correct
+vw2_credit_v1_subscriber_day.txt			Layer 1 — daily rollup			Aggregates vw1 events to one row per subscriber per day
+qa_vw2_credit_v1_subscriber_day.txt			QA on vw2				6 SQL checks: duplicates, negative amounts, count integrity, binary flags, disbursement/amount consistency, future dates
+vw3_credit_v1_layer1_features.txt			Layer 1 — feature engineering		Builds 7d/14d/30d/60d/90d windows, anti-gaming flags, identity maturity signals
+qa_vw3_credit_v1_layer1_features.txt			QA on vw3				8 SQL checks: repayment ratio range, anti-gaming flag integrity, negative exposure, active-days bounds, SIM age, sim_age_cohort values, identity score range, duplicates
+vw4_credit_v1_layer0_scores.txt				Layer 0 — scoring			Converts Layer 1 features into 10 deterministic scores: expected_repayment_probability, expected_credit_loss_rate, churn_cooling_probability, expected_future_transaction_margin_score, expected_treatment_cost_score, customer_lifetime_value_contribution (derived), debt_stress_index_v1, fraud_abuse_risk_score, behavior_consistency_score, identity_confidence_score
+qa_vw4_credit_v1_layer0_scores.txt			QA on vw4				7 SQL checks: all 10 scores in valid range, DSI in [0,100], null scores, CLV formula sanity, anti-gaming flag pass-through integrity, duplicates, vw3→vw4 join coverage
+vw5_credit_v1_reason_codes.txt				Layer 3 — SQL reason codes		Per-subscriber primary_reason_code computed in SQL. Consumed by the Python decision engine as the authoritative source for primary_policy_reason (overrides Python np.select)
+vw6_credit_v1_cap_and_action.txt			Layer 3 — SQL conservative cap		Per-subscriber conservative_credit_limit_v1 and recommended_action computed in SQL. Consumed by select_final_capacity_output as a hard per-subscriber ceiling below policy_capacity_cap
 
-File							Layer				What it does
-vw1_credit_v1_normalized_events.txt			Layer 1 — event classification	Maps every raw transaction to event_family, resolves subscriber_msisdn, computes 									signed_amount
-qa_vw1_credit_v1_duplicate_fid.txt			QA on vw1			Detects duplicate financial_id records
-qa_vw1_credit_v1_invalid_subscriber_msisdn.txt		QA on vw1			Flags null or malformed MSISDNs
-qa_vw1_credit_v1_service_family_mapping_coverage.txt	QA on vw1			Checks all service types are mapped to a family
-qa_vw1_credit_v1_signed_amount_sanity.txt		QA on vw1			Validates signed amounts are directionally correct
-vw2_credit_v1_subscriber_day.txt			Layer 1 — daily rollup		Aggregates vw1 events to one row per subscriber per day
-vw3_credit_v1_layer1_features.txt			Layer 1 — feature engineering	Builds 7d/14d/30d/60d/90d windows, anti-gaming flags, identity 								maturity signals
-vw4_credit_v1_layer0_scores.txt				Layer 0 — scoring		Converts Layer 1 features into 8 deterministic scores (repayment 											probability, DSI, fraud risk, etc.)
-vw5_credit_v1_reason_codes.txt				Layer 3 			support	Priority-ordered reason codes used by the policy prefilter
-vw6_credit_v1_cap_and_action.txt			Layer 3 			support	Conservative credit cap and 															RESTRICT/REDUCE/MAINTAIN_OR_INCREASE action recommendation
 
+Python Decision Engine
 
-Python Decision Engine  
-
-layer1_df + layer0_df  (output of vw3 + vw4)
+layer1_df + layer0_df + vw5_df + vw6_df (outputs of vw3–vw6)
       │
       ▼
 
 File					Layer			What it does
-Config.txt				Config for Layers 2–4	All thresholds, caps, stability bounds, budget settings, anti-gaming switches for the decision 							engine
-run_credit_v1_decision_engine.txt	Layers 2–4		Runs prepare_decision_base → build_policy_prefilter → evaluate_tnv_actions → 										select_final_capacity_output. Produces final CreditLimit per subscriber.
+Config.txt				Config for Layers 2–4	All thresholds, caps, stability bounds, budget settings, anti-gaming switches for the decision engine
+run_credit_v1_decision_engine.txt	Layers 2–4		build_policy_prefilter(vw5_reason_codes_df) overrides primary_policy_reason with SQL-authoritative vw5 value. select_final_capacity_output(vw6_cap_action_df) applies conservative_credit_limit_v1 as hard per-subscriber ceiling. run_credit_v1_decision_engine(circuit_breaker_multiplier) scales policy_capacity_cap by the portfolio feedback multiplier before TNV evaluation. QA gate runs qa_decision_engine_output after each run.
+qa_decision_engine_output.txt		QA on decision engine	10 Python checks on final_capacity_df and policy_prefilter_df: negative limits, cap compliance, invalid actions, invalid statuses, duplicate MSISDNs, restricted-with-nonzero-limit, stability bounds, invalid reason codes, empty feasible sets
+
 
 State, Portfolio, Governance
 
@@ -47,71 +50,88 @@ policy_prefilter_df + final_capacity_df
 
 File				Layer			What it does
 Config_Layer_5_to_8.txt		Config for Layers 5–8	State thresholds, intervention triggers, portfolio circuit breaker multipliers, governance roles
-run_layers_5_to_8.txt		Layers 5–8		Assigns customer state (with persistence enforcement), generates intervention flags, monitors 								portfolio health (emits circuit breaker multiplier), writes governance log
+run_layers_5_to_8.txt		Layers 5–8		Assigns customer state (with persistence enforcement), generates intervention flags, monitors portfolio health (emits circuit_breaker_capacity_multiplier), writes governance log. Multiplier is passed back to next batch run via orchestrator.
+
 
 Real-Time Eligibility API
+
 Lender API call  ──▶  Feature Store  ──▶  Decision Engine  ──▶  Response
 
 File				Layer				What it does
-dim3_feature_store.txt		Dimension 3 — data serving	Hot/warm/cold in-memory store. Hot path refreshed every 15 min. Warm path updated per lender 								event. Cold path refreshed by daily batch.
-dim3_eligibility_api.txt	Dimension 3 — API		check_eligibility() and check_eligibility_batch(). Reads from feature store, runs decision engine, 							returns external-safe EligibilityResponse within 200ms p99.
+dim3_feature_store.txt		Dimension 3 — data serving	Hot/warm/cold in-memory store. Hot path refreshed every 15 min. Warm path updated per lender event. Cold path refreshed by daily batch. get_store_health correctly reports freshest_write=max(written_ats), oldest_write=min(written_ats).
+dim3_eligibility_api.txt	Dimension 3 — API		check_eligibility() and check_eligibility_batch(). Reads from feature store, runs decision engine, returns external-safe EligibilityResponse within 200ms p99. stale_path_threshold_minutes=15 aligns with HOT_PATH_MAX_AGE_MINUTES.
+qa_api_output_contract.txt	QA on API + state outputs	12 Python checks: EligibilityResponse field validity (7 checks including NO_DATA/nonzero-limit and latency SLA), state transition output validity (5 checks including persistence-block-without-prior-state)
+
 
 Lender Feedback Loop
 
 Lender submits report  ──▶  Validate  ──▶  Ingest  ──▶  Reconcile / Update / Compliance check
 
-
 File				Layer			What it does
 dim6_config.txt			Dimension 6 — config	All thresholds for feedback validation, outcome tracking, fairness monitoring, and explainability
-dim6_lender_feedback_api.txt	Dimension 6 — feedback	validate_lender_report → ingest_lender_report → reconcile_lender_vs_observed → 										compute_near_realtime_exposure_update → detect_lender_noncompliance
-dim6_outcome_tracking.txt	Dimension 6 — outcomes	store_decision_snapshot → compute_realised_outcomes → compute_calibration_metrics → 									compute_dsi_accuracy → compute_fairness_metrics → generate_all_explanations
+dim6_lender_feedback_api.txt	Dimension 6 — feedback	validate_lender_report → ingest_lender_report → reconcile_lender_vs_observed → compute_near_realtime_exposure_update → detect_lender_noncompliance
+dim6_outcome_tracking.txt	Dimension 6 — outcomes	store_decision_snapshot → compute_realised_outcomes → compute_calibration_metrics → compute_dsi_accuracy → compute_fairness_metrics → generate_all_explanations
+
+
+Orchestration
+
+File			Role
+orchestrator.txt	Full batch DAG with dependency ordering (vw1→…→vw6→decision engine→layers 5-8→feature store→outcome tracking). Cross-cycle state persistence: previous_capacity_df (stability smoothing), prior_state_df (persistence enforcement), circuit_breaker_multiplier (portfolio feedback). QA gates between SQL and Python stages. Near-realtime lender feedback event handler that writes to warm feature path immediately.
+
 
 External Lender Interface
 
 final_capacity_df  ──▶  Strip internals  ──▶  MSISDN + CreditLimit only
 
 File				Layer		What it does
-external_lender_interface.txt	Layer 9		build_external_lender_interface() — removes all scores, states, reason codes, TNV components. Only MSISDN + 						CreditLimit (+ optional metadata) leave the system.
+external_lender_interface.txt	Layer 9		build_external_lender_interface() — removes all scores, states, reason codes, TNV components. Only MSISDN + CreditLimit (+ optional metadata) leave the system.
+
 
 Architecture Documentation
 
 File					Role
-solution_description.txt / README.md	Identical. Full 9-layer architecture description, design principles, and the core rule: lenders receive only MSISDN 					+ CreditLimit.
+solution_description.txt / README.md	Identical. Full 9-layer architecture description, design principles, and the core rule: lenders receive only MSISDN + CreditLimit.
 
+
+Visual flow
 
 Transactions.txt / Repayments.txt / disbursement.txt
   (sample raw data)
         │
         ▼
-vw1  ──QA views──▶  vw2  ──▶  vw3  ──▶  vw4
-(classify)          (daily)    (features) (scores)
-        │                                   │
-        └───────────────────────────────────┘
-                          │
-                    Config.txt
-                          │
-                          ▼
-            run_credit_v1_decision_engine
-              (Layers 2-4: prefilter → TNV → capacity)
-                          │
-              Config_Layer_5_to_8.txt
-                          │
-                          ▼
-                 run_layers_5_to_8
-              (Layers 5-8: state → intervention
-               → portfolio → governance)
-                          │
-                ┌─────────┴──────────┐
-                │                    │
-                ▼                    ▼
-   dim3_feature_store        dim6_lender_feedback_api
-   dim3_eligibility_api      dim6_outcome_tracking
-   (real-time serving)       (feedback + calibration)
-                │                    │
-                └─────────┬──────────┘
-                           │
-               external_lender_interface
-               (MSISDN + CreditLimit only)
-                           │
-                           ▼
-                        Lenders
+vw1──QA(vw1)──▶ vw2──QA(vw2)──▶ vw3──QA(vw3)──▶ vw4──QA(vw4)──▶ vw5 ──▶ vw6
+(classify)       (daily)          (features)        (10 scores)     (reasons) (caps)
+        │                                                │                │
+        └────────────────────────────────────────────────┘                │
+                                  │                                       │
+                            Config.txt                                    │
+                                  │                                       │
+                                  ▼                              (vw5 + vw6 consumed)
+                    run_credit_v1_decision_engine ◀──────────────────────┘
+                      + circuit_breaker_multiplier (from prior portfolio run)
+                      + QA gate (qa_decision_engine_output)
+                                  │
+                    Config_Layer_5_to_8.txt
+                                  │
+                                  ▼
+                         run_layers_5_to_8
+                    (state → intervention → portfolio → governance)
+                    emits circuit_breaker_multiplier for next run
+                                  │
+                    ┌─────────────┴──────────────┐
+                    │                            │
+                    ▼                            ▼
+       dim3_feature_store             dim6_lender_feedback_api
+       dim3_eligibility_api           dim6_outcome_tracking
+       + qa_api_output_contract       (feedback + calibration)
+       (real-time serving)
+                    │                            │
+                    └────────────┬───────────────┘
+                                 │
+                     orchestrator.txt (DAG + cross-cycle state)
+                                 │
+                     external_lender_interface
+                    (MSISDN + CreditLimit only)
+                                 │
+                                 ▼
+                              Lenders
