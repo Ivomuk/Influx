@@ -88,23 +88,26 @@ def write_cold_features(features_df):
 # Read operations
 # ---------------------------------------------------------------------------
 
-def read_features(msisdn, allow_stale=False):
+def read_features(msisdn, allow_stale=False, stale_threshold_minutes=None):
     """
     Reads the freshest available features for a subscriber.
     Priority: hot → warm → cold.
     Returns a tuple (features_dict, path_used, age_minutes, is_stale).
     Raises RuntimeError if no path has data within the graceful degradation window
     and allow_stale is False.
+    stale_threshold_minutes: overrides HOT_PATH_MAX_AGE_MINUTES for is_stale calculation,
+    allowing callers (e.g. the eligibility API) to drive staleness from their own config.
     """
     msisdn_str = str(msisdn)
-    max_age = GRACEFUL_DEGRADATION_MAX_AGE_MINUTES if allow_stale else HOT_PATH_MAX_AGE_MINUTES
+    threshold = stale_threshold_minutes if stale_threshold_minutes is not None else HOT_PATH_MAX_AGE_MINUTES
+    max_age = GRACEFUL_DEGRADATION_MAX_AGE_MINUTES if allow_stale else threshold
 
     for path_name, store in [('hot', _hot_store), ('warm', _warm_store), ('cold', _cold_store)]:
         entry = store.get(msisdn_str)
         if entry is None:
             continue
         age = _age_minutes(entry['written_at'])
-        is_stale = age > HOT_PATH_MAX_AGE_MINUTES
+        is_stale = age > threshold
 
         if age <= max_age or allow_stale:
             return entry['features'], path_name, age, is_stale
@@ -115,17 +118,20 @@ def read_features(msisdn, allow_stale=False):
     )
 
 
-def read_features_batch(msisdn_list, allow_stale=False):
+def read_features_batch(msisdn_list, allow_stale=False, stale_threshold_minutes=None):
     """
     Reads features for a list of MSISDNs.
     Returns a DataFrame with one row per subscriber plus path_used, age_minutes, is_stale columns.
     MSISDNs with no data are returned with all feature columns set to None
     and path_used = 'none'.
+    stale_threshold_minutes: forwarded to read_features() for each MSISDN.
     """
     rows = []
     for msisdn in msisdn_list:
         try:
-            features, path_used, age_min, is_stale = read_features(msisdn, allow_stale=allow_stale)
+            features, path_used, age_min, is_stale = read_features(
+                msisdn, allow_stale=allow_stale, stale_threshold_minutes=stale_threshold_minutes
+            )
             row = dict(features)
             row['subscriber_msisdn'] = msisdn
             row['path_used'] = path_used

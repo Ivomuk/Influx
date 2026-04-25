@@ -127,7 +127,10 @@ def check_eligibility(msisdn, config_dict=None, previous_credit_limit=None):
     t0 = time.perf_counter()
     try:
         from dim3_feature_store import read_features
-        features_dict, path_used, age_min, is_stale = read_features(msisdn, allow_stale=True)
+        features_dict, path_used, age_min, is_stale = read_features(
+            msisdn, allow_stale=True,
+            stale_threshold_minutes=api_config['stale_path_threshold_minutes']
+        )
     except RuntimeError:
         # No data at all for this subscriber.
         latency_ms = round((time.perf_counter() - t_start) * 1000, 1)
@@ -218,7 +221,10 @@ def check_eligibility_batch(msisdn_list, config_dict=None, previous_capacity_df=
     # Step 1: Bulk feature read
     # ------------------------------------------------------------------
     from dim3_feature_store import read_features_batch
-    features_df = read_features_batch(msisdn_list, allow_stale=True)
+    features_df = read_features_batch(
+        msisdn_list, allow_stale=True,
+        stale_threshold_minutes=api_config['stale_path_threshold_minutes']
+    )
 
     has_data = features_df['path_used'] != 'none'
     no_data_df = features_df[~has_data].copy()
