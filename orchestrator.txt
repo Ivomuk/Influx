@@ -38,14 +38,20 @@ from datetime import datetime, timezone
 # from dim6_lender_feedback_api import run_lender_feedback_pipeline
 # from qa_decision_engine_output import run_qa_decision_engine_output
 # from qa_api_output_contract import run_qa_api_and_states
+# from data_contracts import validate_all_pipeline_inputs
+# from run_certification import run_certification, assert_certified
+# from operating_modes import detect_operating_mode, apply_operating_mode_overrides, build_mode_log_entry
+# from decision_replay import replay_decisions, diff_decisions
 
 # ---------------------------------------------------------------------------
 # Persistent cross-cycle state (held in memory between runs; persist to
 # storage in production so restarts do not lose state).
 # ---------------------------------------------------------------------------
-_previous_capacity_df = None    # stability smoothing: CreditLimit from prior run
-_prior_state_df = None          # persistence enforcement: state + state_change_dt
-_circuit_breaker_multiplier = 1.0  # portfolio feedback: scaled by Layer 7
+_previous_capacity_df = None        # stability smoothing: CreditLimit from prior run
+_prior_state_df = None              # persistence enforcement: state + state_change_dt
+_circuit_breaker_multiplier = 1.0   # portfolio feedback: scaled by Layer 7
+_current_operating_mode = 'NORMAL'  # incident-time mode: gates config overrides
+_last_certification_report = None   # most recent certification result
 
 
 # ---------------------------------------------------------------------------
@@ -85,37 +91,31 @@ def run_sql_batch_pipeline(execution_date):
 # Step 2: QA gates — SQL outputs
 # ---------------------------------------------------------------------------
 
-def run_sql_qa_gates(layer1_df, layer0_df):
+def run_sql_qa_gates(layer1_df, layer0_df, vw5_df=None, vw6_df=None):
     """
-    Runs QA assertions on vw3 and vw4 output before feeding the decision engine.
-    Raises RuntimeError if any critical check fails.
+    Validates schema contracts on all SQL outputs, then runs structural QA checks.
+    Raises ContractViolationError or RuntimeError if any critical check fails.
     """
+    from data_contracts import validate_all_pipeline_inputs, ContractViolationError
+
+    print(f'[{_now()}] Running data contract validation.')
+    validate_all_pipeline_inputs(layer1_df, layer0_df, vw5_df, vw6_df, strict=True)
+
     print(f'[{_now()}] Running SQL QA gates.')
 
-    # Duplicate check on vw3
-    dupes_l1 = (
-        layer1_df.groupby(['feature_dt', 'subscriber_msisdn'])
-        .size()
-        .reset_index(name='count')
-    )
+    dupes_l1 = layer1_df.groupby(['feature_dt', 'subscriber_msisdn']).size().reset_index(name='count')
     if (dupes_l1['count'] > 1).any():
         raise RuntimeError('QA GATE FAIL: duplicate (feature_dt, subscriber_msisdn) in layer1_df')
 
-    # Duplicate check on vw4
-    dupes_l0 = (
-        layer0_df.groupby(['feature_dt', 'subscriber_msisdn'])
-        .size()
-        .reset_index(name='count')
-    )
+    dupes_l0 = layer0_df.groupby(['feature_dt', 'subscriber_msisdn']).size().reset_index(name='count')
     if (dupes_l0['count'] > 1).any():
         raise RuntimeError('QA GATE FAIL: duplicate (feature_dt, subscriber_msisdn) in layer0_df')
 
-    # DSI range check
     if 'debt_stress_index_v1' in layer0_df.columns:
         if layer0_df['debt_stress_index_v1'].lt(0).any() or layer0_df['debt_stress_index_v1'].gt(100).any():
             raise RuntimeError('QA GATE FAIL: debt_stress_index_v1 outside [0, 100]')
 
-    print(f'[{_now()}] SQL QA gates passed.')
+    print(f'[{_now()}] Data contracts + SQL QA gates passed.')
 
 
 # ---------------------------------------------------------------------------
@@ -125,18 +125,31 @@ def run_sql_qa_gates(layer1_df, layer0_df):
 def run_decision_engine_step(layer1_df, layer0_df, vw5_df, vw6_df,
                               config_dict, action_specs_df):
     """
-    Runs the Python decision engine with:
-      - vw5/vw6 wired as authoritative SQL artifacts
-      - previous_capacity_df for stability smoothing
-      - circuit_breaker_multiplier from prior portfolio run
+    Detects the current operating mode, applies config overrides, then runs the
+    Python decision engine with vw5/vw6 wired as authoritative SQL artifacts.
     """
-    global _previous_capacity_df, _circuit_breaker_multiplier
+    global _previous_capacity_df, _circuit_breaker_multiplier, _current_operating_mode
 
-    print(f'[{_now()}] Decision engine starting. circuit_breaker_multiplier={_circuit_breaker_multiplier}')
+    from operating_modes import detect_operating_mode, apply_operating_mode_overrides, build_mode_log_entry
+    from dim3_feature_store import get_store_health
+
+    # Detect mode from current signals before running the engine.
+    cert_passed = (_last_certification_report is None or _last_certification_report.get('certified', True))
+    _current_operating_mode, mode_reasons = detect_operating_mode(
+        circuit_breaker_multiplier=_circuit_breaker_multiplier,
+        feature_store_health_df=get_store_health(),
+        certification_passed=cert_passed,
+    )
+    effective_config = apply_operating_mode_overrides(
+        config_dict, _current_operating_mode, _circuit_breaker_multiplier
+    )
+
+    print(f'[{_now()}] Decision engine starting. '
+          f'mode={_current_operating_mode} circuit_breaker={_circuit_breaker_multiplier}')
 
     engine_outputs = run_credit_v1_decision_engine(
         layer1_df, layer0_df,
-        config_dict=config_dict,
+        config_dict=effective_config,
         action_specs_input_df=action_specs_df,
         previous_capacity_df=_previous_capacity_df,
         vw5_reason_codes_df=vw5_df,
@@ -264,12 +277,22 @@ def load_cross_cycle_state(run_date):
 def run_batch_pipeline(
     execution_date,
     lender_feedback_df,
+    # Certification inputs (SQL QA check dicts sourced from qa_vw*.txt files)
+    bq_client=None,
+    sql_qa_vw1_checks=None,
+    sql_qa_vw2_checks=None,
+    sql_qa_vw3_checks=None,
+    sql_qa_vw4_checks=None,
+    eligibility_df=None,
+    # Decision engine
     config_dict=None,
     action_specs_df=None,
+    # Layers 5–8
     state_config=None,
     intervention_config=None,
     portfolio_config=None,
     governance_config=None,
+    # Outcome tracking
     outcome_config=None,
     fairness_config=None,
     explainability_config=None,
@@ -277,11 +300,13 @@ def run_batch_pipeline(
     """
     Runs the full daily batch pipeline in dependency order.
     Cross-cycle state (_previous_capacity_df, _prior_state_df,
-    _circuit_breaker_multiplier) is updated automatically between cycles.
+    _circuit_breaker_multiplier, _current_operating_mode) is updated
+    automatically between cycles.
 
     Returns a dict of all outputs for downstream inspection or storage.
     """
     global _previous_capacity_df
+    from run_certification import run_certification, assert_certified
 
     t_start = time.perf_counter()
     print(f'\n{"="*60}')
@@ -291,8 +316,8 @@ def run_batch_pipeline(
     # Step 1: SQL views
     layer1_df, layer0_df, vw5_df, vw6_df = run_sql_batch_pipeline(execution_date)
 
-    # Step 2: QA gates
-    run_sql_qa_gates(layer1_df, layer0_df)
+    # Step 2: Data contracts + QA gates
+    run_sql_qa_gates(layer1_df, layer0_df, vw5_df, vw6_df)
 
     # Step 3: Decision engine
     engine_outputs = run_decision_engine_step(
@@ -325,16 +350,35 @@ def run_batch_pipeline(
         'vw9_credit_v1_final_capacity_output'
     ][['subscriber_msisdn', 'CreditLimit']].copy()
 
-    # Step 7: Persist cross-cycle state
+    # Step 7: Certification — runs all QA suites and gates pipeline completion
+    global _last_certification_report
+    _last_certification_report = run_certification(
+        bq_client=bq_client,
+        sql_qa_vw1_checks=sql_qa_vw1_checks,
+        sql_qa_vw2_checks=sql_qa_vw2_checks,
+        sql_qa_vw3_checks=sql_qa_vw3_checks,
+        sql_qa_vw4_checks=sql_qa_vw4_checks,
+        engine_outputs=engine_outputs,
+        config_dict=config_dict or DECISION_ENGINE_CONFIG,
+        eligibility_df=eligibility_df,
+        state_df=layer_outputs['state_df'],
+        previous_capacity_df=_previous_capacity_df,
+        pipeline_run_id=f'batch_{execution_date}',
+    )
+    assert_certified(_last_certification_report, halt_on_failure=False)
+
+    # Step 8: Persist cross-cycle state
     persist_cross_cycle_state(execution_date)
 
     elapsed = round((time.perf_counter() - t_start) / 60, 1)
     print(f'\n[{_now()}] Batch pipeline complete in {elapsed} min.')
 
     return {
-        'engine_outputs': engine_outputs,
-        'layer_outputs': layer_outputs,
-        'tracking_outputs': tracking_outputs,
+        'engine_outputs':        engine_outputs,
+        'layer_outputs':         layer_outputs,
+        'tracking_outputs':      tracking_outputs,
+        'certification_report':  _last_certification_report,
+        'operating_mode':        _current_operating_mode,
     }
 
 
