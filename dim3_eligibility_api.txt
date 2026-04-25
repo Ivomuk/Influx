@@ -8,7 +8,7 @@
 #   Total p99 target         :  < 200 ms
 #
 # Graceful degradation:
-#   If features are stale (> 30 min) : serve last-known CreditLimit with is_stale=True
+#   If features are stale (> 15 min) : serve last-known CreditLimit with is_stale=True
 #   If features are missing entirely  : return CreditLimit=0, decision_status=NO_DATA
 #   If decision engine errors         : return CreditLimit=0, decision_status=ENGINE_ERROR
 #
@@ -34,8 +34,8 @@ ELIGIBILITY_API_CONFIG = {
     'latency_budget_prefilter_ms': 20,
     'latency_budget_tnv_ms': 80,
     'latency_budget_total_ms': 200,
-    # Number of milliseconds before a stale-path response is served.
-    'stale_path_threshold_ms': 30,
+    # Age in minutes beyond which features are considered stale (aligns with HOT_PATH_MAX_AGE_MINUTES=15).
+    'stale_path_threshold_minutes': 15,
     # Return this CreditLimit when no data is available rather than erroring.
     'no_data_credit_limit': 0,
     # If True, log timing to stdout for observability.

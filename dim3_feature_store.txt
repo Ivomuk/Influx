@@ -176,8 +176,8 @@ def get_store_health():
         return {
             'path': name,
             'record_count': len(store),
-            'freshest_write': min(written_ats).isoformat(),
-            'oldest_write': max(written_ats).isoformat(),
+            'freshest_write': max(written_ats).isoformat(),
+            'oldest_write': min(written_ats).isoformat(),
             'max_age_minutes': round(max(ages), 1),
         }
 

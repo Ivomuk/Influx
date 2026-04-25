@@ -1,0 +1,153 @@
+# QA suite for the real-time Eligibility API output contract and
+# Layer 5-8 state transition outputs.
+# Call after check_eligibility_batch() and run_layers_5_to_8() respectively.
+# Returns a dict of {check_name: fail_df or fail_list}; all empty = full pass.
+
+import pandas as pd
+import numpy as np
+
+VALID_DECISION_STATUSES_API = {'approved_or_maintained', 'blocked_or_restricted', 'NO_DATA', 'ENGINE_ERROR'}
+VALID_OPERATING_STATES = {'Healthy', 'At Risk', 'Distressed', 'Cooling Off', 'Recovered', 'Restricted', 'Fraud Review'}
+LATENCY_SLA_MS = 200
+
+
+# ---------------------------------------------------------------------------
+# Eligibility API output contract
+# ---------------------------------------------------------------------------
+
+def qa_eligibility_response(eligibility_df, latency_sla_ms=LATENCY_SLA_MS):
+    """
+    Validates the DataFrame returned by check_eligibility_batch().
+    Each row is one EligibilityResponse.
+    """
+    results = {}
+    df = eligibility_df.copy()
+
+    required_cols = {'MSISDN', 'CreditLimit', 'validity_period_days', 'decision_timestamp',
+                     'policy_version', 'decision_status', 'is_stale', 'batch_latency_ms'}
+    missing = required_cols - set(df.columns)
+    if missing:
+        results['QA-API-00_missing_columns'] = list(missing)
+        print(f'QA FAIL [QA-API-00]: missing columns {missing}')
+        return results
+
+    # QA-API-01: Negative CreditLimit
+    results['QA-API-01_negative_credit_limit'] = df[df['CreditLimit'] < 0][['MSISDN', 'CreditLimit']]
+    _print_result('QA-API-01', results['QA-API-01_negative_credit_limit'])
+
+    # QA-API-02: Invalid decision_status
+    results['QA-API-02_invalid_decision_status'] = df[
+        ~df['decision_status'].isin(VALID_DECISION_STATUSES_API)
+    ][['MSISDN', 'decision_status']]
+    _print_result('QA-API-02', results['QA-API-02_invalid_decision_status'])
+
+    # QA-API-03: is_stale outside {0, 1}
+    results['QA-API-03_invalid_is_stale'] = df[~df['is_stale'].isin([0, 1])][['MSISDN', 'is_stale']]
+    _print_result('QA-API-03', results['QA-API-03_invalid_is_stale'])
+
+    # QA-API-04: validity_period_days <= 0
+    results['QA-API-04_invalid_validity_days'] = df[df['validity_period_days'] <= 0][['MSISDN', 'validity_period_days']]
+    _print_result('QA-API-04', results['QA-API-04_invalid_validity_days'])
+
+    # QA-API-05: Batch latency SLA breach
+    results['QA-API-05_latency_sla_breach'] = df[df['batch_latency_ms'] > latency_sla_ms * len(df)][['MSISDN', 'batch_latency_ms']]
+    _print_result('QA-API-05', results['QA-API-05_latency_sla_breach'])
+
+    # QA-API-06: Duplicate MSISDN in response
+    dupes = df.groupby('MSISDN').size().reset_index(name='count')
+    results['QA-API-06_duplicate_msisdn'] = dupes[dupes['count'] > 1]
+    _print_result('QA-API-06', results['QA-API-06_duplicate_msisdn'])
+
+    # QA-API-07: NO_DATA rows have non-zero CreditLimit
+    no_data = df[df['decision_status'] == 'NO_DATA']
+    results['QA-API-07_no_data_nonzero_limit'] = no_data[no_data['CreditLimit'] != 0][['MSISDN', 'CreditLimit']]
+    _print_result('QA-API-07', results['QA-API-07_no_data_nonzero_limit'])
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# State transition output contract (Layer 5)
+# ---------------------------------------------------------------------------
+
+def qa_state_transitions(state_df, prior_state_df=None):
+    """
+    Validates the DataFrame returned by build_customer_state_df().
+    """
+    results = {}
+    df = state_df.copy()
+
+    required_cols = {'feature_dt', 'subscriber_msisdn', 'operating_state',
+                     'persistence_block_applied', 'state_change_dt'}
+    missing = required_cols - set(df.columns)
+    if missing:
+        results['QA-ST-00_missing_columns'] = list(missing)
+        print(f'QA FAIL [QA-ST-00]: missing columns {missing}')
+        return results
+
+    # QA-ST-01: operating_state contains unexpected values
+    results['QA-ST-01_invalid_operating_state'] = df[
+        ~df['operating_state'].isin(VALID_OPERATING_STATES)
+    ][['feature_dt', 'subscriber_msisdn', 'operating_state']]
+    _print_result('QA-ST-01', results['QA-ST-01_invalid_operating_state'])
+
+    # QA-ST-02: persistence_block_applied outside {0, 1}
+    results['QA-ST-02_invalid_persistence_flag'] = df[
+        ~df['persistence_block_applied'].isin([0, 1])
+    ][['feature_dt', 'subscriber_msisdn', 'persistence_block_applied']]
+    _print_result('QA-ST-02', results['QA-ST-02_invalid_persistence_flag'])
+
+    # QA-ST-03: state_change_dt is in the future
+    df['state_change_dt_parsed'] = pd.to_datetime(df['state_change_dt'], errors='coerce')
+    df['feature_dt_parsed'] = pd.to_datetime(df['feature_dt'], errors='coerce')
+    results['QA-ST-03_state_change_dt_future'] = df[
+        df['state_change_dt_parsed'] > df['feature_dt_parsed']
+    ][['feature_dt', 'subscriber_msisdn', 'state_change_dt']]
+    _print_result('QA-ST-03', results['QA-ST-03_state_change_dt_future'])
+
+    # QA-ST-04: Duplicate (feature_dt, subscriber_msisdn)
+    dupes = df.groupby(['feature_dt', 'subscriber_msisdn']).size().reset_index(name='count')
+    results['QA-ST-04_duplicate_msisdn'] = dupes[dupes['count'] > 1]
+    _print_result('QA-ST-04', results['QA-ST-04_duplicate_msisdn'])
+
+    # QA-ST-05: Persistence block applied but no prior state available
+    # If block is 1 there must be a prior_operating_state.
+    if 'prior_operating_state' in df.columns:
+        blocked = df[df['persistence_block_applied'] == 1]
+        results['QA-ST-05_block_without_prior_state'] = blocked[
+            blocked['prior_operating_state'].isna()
+        ][['feature_dt', 'subscriber_msisdn']]
+        _print_result('QA-ST-05', results['QA-ST-05_block_without_prior_state'])
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _print_result(label, result):
+    if isinstance(result, pd.DataFrame) and not result.empty:
+        print(f'QA FAIL [{label}]: {len(result)} rows')
+    elif isinstance(result, list) and result:
+        print(f'QA FAIL [{label}]: {result}')
+
+
+def run_qa_api_and_states(eligibility_df, state_df, prior_state_df=None):
+    """
+    Entry point. Runs both suites and prints a combined summary.
+    """
+    results = {}
+    results.update(qa_eligibility_response(eligibility_df))
+    results.update(qa_state_transitions(state_df, prior_state_df))
+
+    failed = {
+        k: v for k, v in results.items()
+        if (isinstance(v, pd.DataFrame) and not v.empty)
+        or (isinstance(v, list) and v)
+    }
+    passed = len(results) - len(failed)
+    print(f'\nAPI + State QA: {passed}/{len(results)} checks passed.')
+    if failed:
+        print(f'FAILED checks: {list(failed.keys())}')
+    return results
