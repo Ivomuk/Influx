@@ -26,7 +26,37 @@ DECISION_ENGINE_CONFIG = {
     'validity_days_reduce': 14,
     'validity_days_maintain': 14,
     'validity_days_increase': 7,
-    'output_version': 'credit_v1_python_decision_engine_prod'
+    'output_version': 'credit_v1_python_decision_engine_prod',
+
+    # -----------------------------------------------------------------------
+    # Dimension 4: Decision stability — bound how fast capacity can move
+    # between consecutive evaluation cycles.
+    # -----------------------------------------------------------------------
+    # Maximum fraction CreditLimit may increase in one cycle (e.g. 0.25 = +25%).
+    'stability_max_increase_pct': 0.25,
+    # Maximum fraction CreditLimit may decrease in one cycle (e.g. 0.40 = -40%).
+    'stability_max_decrease_pct': 0.40,
+    # Minimum days that must separate a RESTRICT → non-RESTRICT transition.
+    'stability_restrict_cooldown_days': 14,
+
+    # -----------------------------------------------------------------------
+    # Dimension 4: Network-wide lending budget constraint.
+    # Set budget_constraint_enabled = False to disable until calibrated.
+    # -----------------------------------------------------------------------
+    'budget_constraint_enabled': False,
+    # Maximum total CreditLimit the system may approve in a single run (UGX).
+    'network_lending_budget_total': 50_000_000.0,
+    # Segments that receive priority when budget is constrained.
+    # Subscribers outside these states are throttled first.
+    'budget_priority_states': ['Healthy', 'Recovered'],
+
+    # -----------------------------------------------------------------------
+    # Dimension 4: Anti-gaming policy blocks (feeds from vw4 flags).
+    # -----------------------------------------------------------------------
+    # Block lending when timing_manipulation_flag is set.
+    'block_timing_manipulation': True,
+    # Block lending when loan_cycling_flag is set.
+    'block_loan_cycling': True,
 }
 
 ACTION_SPECS_DF = pd.DataFrame([

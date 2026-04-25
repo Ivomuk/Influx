@@ -17,7 +17,17 @@ STATE_ENGINE_CONFIG = {
     'restricted_actions': ['DECLINE', 'RESTRICT'],
     'minimum_persistence_days_default': 7,
     'minimum_persistence_days_restricted': 14,
-    'minimum_persistence_days_fraud_review': 14
+    'minimum_persistence_days_fraud_review': 14,
+
+    # -----------------------------------------------------------------------
+    # Dimension 4: Persistence enforcement — prevent upward state transitions
+    # before the minimum persistence window has elapsed.
+    # Set enforce_minimum_persistence = False to disable (e.g. during testing).
+    # -----------------------------------------------------------------------
+    'enforce_minimum_persistence': True,
+    # DSI must be below the healthy threshold for this many consecutive days
+    # before a Distressed → Recovered upgrade is permitted.
+    'dsi_hysteresis_days_for_upgrade': 3,
 }
 
 INTERVENTION_CONFIG = {
@@ -34,7 +44,23 @@ PORTFOLIO_CONFIG = {
     'high_distressed_rate_threshold': 0.25,
     'high_fraud_review_rate_threshold': 0.05,
     'high_exposure_concentration_threshold': 0.40,
-    'high_stacked_borrowing_rate_threshold': 0.20
+    'high_stacked_borrowing_rate_threshold': 0.20,
+
+    # -----------------------------------------------------------------------
+    # Dimension 4: Portfolio circuit breaker — when a signal fires, reduce
+    # the effective policy_capacity_cap by the corresponding multiplier.
+    # A multiplier of 0.70 means new approvals are capped at 70% of the
+    # standard policy_capacity_cap until the signal clears.
+    # -----------------------------------------------------------------------
+    'circuit_breaker_enabled': True,
+    'circuit_breaker_multipliers': {
+        'SYSTEM_WIDE_TIGHTENING':    0.60,
+        'DISTRESS_POSTURE_TIGHTENING': 0.70,
+        'FRAUD_PRESSURE_TIGHTENING': 0.65,
+        'EXPOSURE_CAP_REBALANCING':  0.75,
+        'STACKING_CAP_TIGHTENING':   0.80,
+        'STABLE_PORTFOLIO':          1.00,
+    }
 }
 
 GOVERNANCE_CONFIG = {

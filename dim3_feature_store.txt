@@ -1,0 +1,189 @@
+# Dimension 3 — Feature Store Interface
+# Provides hot / warm / cold path abstractions so the eligibility API can read
+# pre-computed features at the appropriate freshness level.
+#
+# Hot path  : in-memory dict or Redis-equivalent — pre-computed features refreshed
+#             every 15 minutes. Target read latency < 5 ms.
+# Warm path : parquet/Delta table written by the near-real-time exposure refresh
+#             job after every lender feedback event. Target freshness < 30 min.
+# Cold path : full batch SQL output from vw3 + vw4 (daily or on-demand).
+#             Used as fallback when hot/warm paths are stale or unavailable.
+#
+# In this v1 the store is backed by an in-memory dict keyed by subscriber_msisdn.
+# In production replace the dict with Redis GET/SET calls or a managed feature store.
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timezone
+
+# ---------------------------------------------------------------------------
+# Staleness thresholds
+# ---------------------------------------------------------------------------
+HOT_PATH_MAX_AGE_MINUTES = 15
+WARM_PATH_MAX_AGE_MINUTES = 30
+GRACEFUL_DEGRADATION_MAX_AGE_MINUTES = 60   # beyond this, do not serve
+
+# ---------------------------------------------------------------------------
+# Feature store state (in-memory; replace with Redis client in production)
+# ---------------------------------------------------------------------------
+_hot_store: dict = {}       # { msisdn: { 'features': {...}, 'written_at': datetime } }
+_warm_store: dict = {}      # same schema, written by near-realtime exposure refresh
+_cold_store: dict = {}      # written by batch job, refreshed daily
+
+
+def _now_utc():
+    return datetime.now(timezone.utc)
+
+
+def _age_minutes(written_at):
+    if written_at is None:
+        return float('inf')
+    return (_now_utc() - written_at).total_seconds() / 60.0
+
+
+# ---------------------------------------------------------------------------
+# Write operations
+# ---------------------------------------------------------------------------
+
+def write_hot_features(features_df):
+    """
+    Writes a DataFrame of subscriber features to the hot path.
+    Called by the 15-minute scheduled feature refresh job.
+    features_df must contain subscriber_msisdn as a column.
+    """
+    now = _now_utc()
+    for _, row in features_df.iterrows():
+        msisdn = str(row['subscriber_msisdn'])
+        _hot_store[msisdn] = {'features': row.to_dict(), 'written_at': now}
+    print(f'Hot path: wrote {len(features_df)} subscriber records at {now.isoformat()}')
+
+
+def write_warm_features(msisdn, updated_exposure_amt, lender_event_type):
+    """
+    Updates the warm path for a single subscriber immediately after a lender
+    feedback event (disbursement or repayment). Only updates exposure fields
+    to avoid stale non-exposure features being treated as fresh.
+    Called by compute_near_realtime_exposure_update in dim6_lender_feedback_api.
+    """
+    now = _now_utc()
+    existing = _warm_store.get(str(msisdn), {}).get('features', {}).copy()
+    existing['outstanding_exposure_amt'] = updated_exposure_amt
+    existing['last_exposure_update_event'] = lender_event_type
+    _warm_store[str(msisdn)] = {'features': existing, 'written_at': now}
+
+
+def write_cold_features(features_df):
+    """
+    Writes the daily batch SQL output (from vw3 + vw4) to the cold path.
+    Called once per day by the batch pipeline.
+    """
+    now = _now_utc()
+    for _, row in features_df.iterrows():
+        msisdn = str(row['subscriber_msisdn'])
+        _cold_store[msisdn] = {'features': row.to_dict(), 'written_at': now}
+    print(f'Cold path: wrote {len(features_df)} subscriber records at {now.isoformat()}')
+
+
+# ---------------------------------------------------------------------------
+# Read operations
+# ---------------------------------------------------------------------------
+
+def read_features(msisdn, allow_stale=False):
+    """
+    Reads the freshest available features for a subscriber.
+    Priority: hot → warm → cold.
+    Returns a tuple (features_dict, path_used, age_minutes, is_stale).
+    Raises RuntimeError if no path has data within the graceful degradation window
+    and allow_stale is False.
+    """
+    msisdn_str = str(msisdn)
+    max_age = GRACEFUL_DEGRADATION_MAX_AGE_MINUTES if allow_stale else HOT_PATH_MAX_AGE_MINUTES
+
+    for path_name, store in [('hot', _hot_store), ('warm', _warm_store), ('cold', _cold_store)]:
+        entry = store.get(msisdn_str)
+        if entry is None:
+            continue
+        age = _age_minutes(entry['written_at'])
+        is_stale = age > HOT_PATH_MAX_AGE_MINUTES
+
+        if age <= max_age or allow_stale:
+            return entry['features'], path_name, age, is_stale
+
+    raise RuntimeError(
+        f'No feature data available for MSISDN {msisdn_str} within '
+        f'{GRACEFUL_DEGRADATION_MAX_AGE_MINUTES} minutes on any path.'
+    )
+
+
+def read_features_batch(msisdn_list, allow_stale=False):
+    """
+    Reads features for a list of MSISDNs.
+    Returns a DataFrame with one row per subscriber plus path_used, age_minutes, is_stale columns.
+    MSISDNs with no data are returned with all feature columns set to None
+    and path_used = 'none'.
+    """
+    rows = []
+    for msisdn in msisdn_list:
+        try:
+            features, path_used, age_min, is_stale = read_features(msisdn, allow_stale=allow_stale)
+            row = dict(features)
+            row['subscriber_msisdn'] = msisdn
+            row['path_used'] = path_used
+            row['feature_age_minutes'] = round(age_min, 1)
+            row['is_stale'] = int(is_stale)
+        except RuntimeError:
+            row = {
+                'subscriber_msisdn': msisdn,
+                'path_used': 'none',
+                'feature_age_minutes': None,
+                'is_stale': 1
+            }
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Bulk load from SQL batch output (used in production bootstrap)
+# ---------------------------------------------------------------------------
+
+def load_from_batch_output(layer1_df, layer0_df):
+    """
+    Initialises the cold path from SQL batch DataFrames (vw3 + vw4 output).
+    In production this is called by the nightly pipeline after SQL views complete.
+    Also bootstraps the hot path so the first eligibility API requests don't miss.
+    """
+    merged_df = layer1_df.merge(layer0_df, on=['feature_dt', 'subscriber_msisdn'], how='inner')
+    write_cold_features(merged_df)
+    write_hot_features(merged_df)
+    print(f'Feature store initialised from batch output: {len(merged_df)} subscribers.')
+    return merged_df
+
+
+# ---------------------------------------------------------------------------
+# Staleness diagnostics
+# ---------------------------------------------------------------------------
+
+def get_store_health():
+    """
+    Returns a summary dict of each path's record count, freshest write, and oldest write.
+    Useful for monitoring dashboards and alerting.
+    """
+    def _summarise(store, name):
+        if not store:
+            return {'path': name, 'record_count': 0, 'freshest_write': None, 'oldest_write': None, 'max_age_minutes': None}
+        ages = [_age_minutes(v['written_at']) for v in store.values()]
+        written_ats = [v['written_at'] for v in store.values()]
+        return {
+            'path': name,
+            'record_count': len(store),
+            'freshest_write': min(written_ats).isoformat(),
+            'oldest_write': max(written_ats).isoformat(),
+            'max_age_minutes': round(max(ages), 1),
+        }
+
+    health = pd.DataFrame([
+        _summarise(_hot_store, 'hot'),
+        _summarise(_warm_store, 'warm'),
+        _summarise(_cold_store, 'cold'),
+    ])
+    return health
