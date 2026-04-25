@@ -1,0 +1,183 @@
+1.Lender submits report (disbursements / repayments / defaults)
+
+
+Raw MoMo Transactions
+        │
+        ▼
+vw1_credit_v1_normalized_events
+  Classifies every transaction into event_family
+  (loan_disbursement, loan_repayment, wallet_inflow, spend, etc.)
+  Signs the amount and resolves subscriber_msisdn
+        │
+        ▼
+vw2_credit_v1_subscriber_day
+  Rolls events up to one row per subscriber per day
+  (daily amounts, counts, flags)
+        │
+        ▼
+vw3_credit_v1_layer1_features   ← Dimension 2 + 5
+  Computes 7d / 14d / 30d / 60d / 90d rolling windows
+  Anti-gaming flags: timing_manipulation, suspicious_repayment_jump, loan_cycling
+  Identity maturity: sim_age_days, sim_age_cohort, has_inflow_and_spend_flag
+        │
+        ▼
+vw4_credit_v1_layer0_scores     ← Dimension 2 + 5
+  Deterministic rule-based scoring (placeholder for future ML)
+  Outputs: expected_repayment_probability, expected_credit_loss_rate,
+           churn_cooling_probability, expected_future_transaction_margin_score,
+           debt_stress_index_v1, fraud_abuse_risk_score, behavior_consistency_score,
+           identity_confidence_score, customer_lifetime_value_contribution
+
+
+2. Decision Engine (Python, Layers 2–4)
+
+layer1_df + layer0_df
+        │
+        ▼
+prepare_decision_base
+  Validates required columns, coerces types, inner-joins L1 + L0
+        │
+        ▼
+build_policy_prefilter          ← Dimension 4 + 5
+  Computes exposure_to_inflow_ratio, thin_file_flag, recent_disbursement_no_repayment_flag
+  Anti-gaming blocks: timing_manipulation_flag, loan_cycling_flag → policy_restrict_flag
+  Sets feasible_action_set per subscriber (which actions are allowed)
+  Sets primary_policy_reason (first matching reason code)
+        │
+        ▼
+evaluate_tnv_actions
+  For each subscriber × each feasible action:
+    Expected TNV = Immediate Margin
+                 + Discounted Future Transaction Margin
+                 − Expected Credit Loss
+                 − Expected Churn Cost
+                 − Expected Treatment Cost
+        │
+        ▼
+select_final_capacity_output    ← Dimension 4
+  Picks highest-TNV feasible action per subscriber
+  Applies policy_capacity_cap (hard ceiling)
+  Applies stability_multiplier (action-level smoothing)
+  Applies stability smoothing: bounds delta from previous cycle
+    (max +25% increase / max −40% decrease per run)
+  Optional: network-wide budget constraint (disabled by default)
+  Outputs: selected_action, CreditLimit, decision_status, prev_credit_limit
+
+
+3. State, Intervention, Portfolio, Governance (Layers 5–8)
+
+policy_prefilter_df + final_capacity_df
+        │
+        ▼
+build_customer_state_df         ← Dimension 4
+  Assigns: Healthy / At Risk / Distressed / Cooling Off / Recovered / Restricted / Fraud Review
+  Persistence enforcement: blocks upward state transitions until minimum days elapsed
+  Tracks state_change_dt for next cycle
+        │
+        ▼
+build_intervention_df
+  Flags: wallet_drop, rising_dsi, missed_repayment, repeat_borrowing, cooling_off, recovery
+  Sets intervention_action per subscriber
+        │
+        ▼
+build_portfolio_monitor_df      ← Dimension 4
+  Computes portfolio-level: restrict_rate, distressed_rate, fraud_review_rate,
+                             stacked_borrowing_rate, exposure_concentration
+  Emits portfolio_control_signal:
+    STABLE_PORTFOLIO → multiplier 1.00
+    STACKING_CAP_TIGHTENING → 0.80
+    EXPOSURE_CAP_REBALANCING → 0.75
+    DISTRESS_POSTURE_TIGHTENING → 0.70
+    FRAUD_PRESSURE_TIGHTENING → 0.65
+    SYSTEM_WIDE_TIGHTENING → 0.60
+  circuit_breaker_capacity_multiplier fed back to next decision run
+        │
+        ▼
+build_governance_log_df
+  Flags high-value and restricted subscribers for manual review
+  Records persistence_block_applied, prev_credit_limit, audit_trigger_flag
+
+
+4. Lender Feedback Loop (Dimension 6, event-driven)
+
+Lender submits report (disbursements / repayments / defaults)
+        │
+        ▼
+validate_lender_report
+  Schema check, event_type whitelist, amount range, date parsing
+        │
+        ▼
+ingest_lender_report
+  Normalises valid rows, computes signed_amount
+        │
+        ├──▶ reconcile_lender_vs_observed
+        │      Matches lender events to vw1 observed events
+        │      Status: MATCHED / LENDER_ONLY / OBSERVED_ONLY / UNMATCHED_AMOUNT
+        │
+        ├──▶ compute_near_realtime_exposure_update
+        │      Updates outstanding_exposure_amt immediately
+        │      Writes to warm path of feature store
+        │
+        └──▶ detect_lender_noncompliance
+               Flags LENT_TO_RESTRICTED_SUBSCRIBER or EXCEEDED_CREDIT_LIMIT
+
+
+5. Real-Time Eligibility API (Dimension 3, request-driven)
+
+Lender calls check_eligibility(msisdn)
+        │
+        ▼
+Feature Store read (hot → warm → cold, <5ms target)
+  If stale (>15min): is_stale=True, still served
+  If missing: return CreditLimit=0, decision_status=NO_DATA
+        │
+        ▼
+_run_single_subscriber_decision
+  Runs full Layer 2–4 engine on single subscriber's features
+  If engine errors: return CreditLimit=0, decision_status=ENGINE_ERROR
+        │
+        ▼
+EligibilityResponse (external-safe fields only)
+  MSISDN, CreditLimit, validity_period_days, decision_timestamp,
+  policy_version, decision_status, is_stale, latency_ms
+  (no scores, states, or reason codes exposed)
+  p99 latency target: <200ms
+
+
+6. Outcome Tracking (Dimension 6, runs after each batch)
+
+final_capacity_df + layer0_df + layer1_df
+        │
+        ▼
+store_decision_snapshot
+  Joins decision + all L0 scores + key L1 features into timestamped record
+        │
+        ▼
+compute_realised_outcomes  (after outcome_lookback_days = 30)
+  Joins snapshots to lender_feedback: did_repay, did_default, actual_repayment_ratio
+        │
+        ├──▶ compute_calibration_metrics
+        │      Predicted vs actual repayment rate by probability decile
+        │      Flags miscalibrated buckets (error > 0.10)
+        │
+        ├──▶ compute_dsi_accuracy
+        │      Actual default rate per DSI band
+        │      Monotonicity check: higher DSI must mean higher default rate
+        │
+        ├──▶ compute_fairness_metrics
+        │      Restrict rate per segment (sim_age_cohort, kyc_tier, region)
+        │      Disparate impact flag if segment rate > 3× system average
+        │
+        └──▶ generate_all_explanations
+               Per-subscriber: primary_driver, counterfactual_text,
+               full_text, sms_text (≤160 chars)
+
+
+7. External Lender Interface (Layer 9)
+
+final_capacity_df
+        │
+        ▼
+build_external_lender_interface
+  Strips all internal fields (scores, states, reason codes, TNV components)
+  Exposes only: MSISDN + CreditLimit (+ optional metadata if configured)

@@ -1,0 +1,117 @@
+1. Reference Data (inputs to vw1)
+
+File	Role
+loan_related_services_list.txt	The list of sub_service_names that classify as loan events (MoPesa, XtraCash, Jumo, Mokash, MoMo Advance). Used as the lookup 				that drives event_family assignment in vw1.
+Transactions_types_list.txt	Full catalogue of 17 MoMo service types. Used to understand which service families exist and ensure vw1 covers all of them.
+Repayments.txt			Sample repayment transaction rows — input data that flows into vw1
+disbursement.txt		Sample disbursement transaction rows — input data that flows into vw1
+Transactions.txt		Sample non-loan transaction rows (P2P, Airtime) — also input to vw1
+
+
+
+Batch SQL Pipeline
+
+Raw Transactions
+      │
+      ▼
+
+
+File							Layer				What it does
+vw1_credit_v1_normalized_events.txt			Layer 1 — event classification	Maps every raw transaction to event_family, resolves subscriber_msisdn, computes 									signed_amount
+qa_vw1_credit_v1_duplicate_fid.txt			QA on vw1			Detects duplicate financial_id records
+qa_vw1_credit_v1_invalid_subscriber_msisdn.txt		QA on vw1			Flags null or malformed MSISDNs
+qa_vw1_credit_v1_service_family_mapping_coverage.txt	QA on vw1			Checks all service types are mapped to a family
+qa_vw1_credit_v1_signed_amount_sanity.txt		QA on vw1			Validates signed amounts are directionally correct
+vw2_credit_v1_subscriber_day.txt			Layer 1 — daily rollup		Aggregates vw1 events to one row per subscriber per day
+vw3_credit_v1_layer1_features.txt			Layer 1 — feature engineering	Builds 7d/14d/30d/60d/90d windows, anti-gaming flags, identity 								maturity signals
+vw4_credit_v1_layer0_scores.txt				Layer 0 — scoring		Converts Layer 1 features into 8 deterministic scores (repayment 											probability, DSI, fraud risk, etc.)
+vw5_credit_v1_reason_codes.txt				Layer 3 			support	Priority-ordered reason codes used by the policy prefilter
+vw6_credit_v1_cap_and_action.txt			Layer 3 			support	Conservative credit cap and 															RESTRICT/REDUCE/MAINTAIN_OR_INCREASE action recommendation
+
+
+Python Decision Engine  
+
+layer1_df + layer0_df  (output of vw3 + vw4)
+      │
+      ▼
+
+File					Layer			What it does
+Config.txt				Config for Layers 2–4	All thresholds, caps, stability bounds, budget settings, anti-gaming switches for the decision 							engine
+run_credit_v1_decision_engine.txt	Layers 2–4		Runs prepare_decision_base → build_policy_prefilter → evaluate_tnv_actions → 										select_final_capacity_output. Produces final CreditLimit per subscriber.
+
+State, Portfolio, Governance
+
+policy_prefilter_df + final_capacity_df
+      │
+      ▼
+
+File				Layer			What it does
+Config_Layer_5_to_8.txt		Config for Layers 5–8	State thresholds, intervention triggers, portfolio circuit breaker multipliers, governance roles
+run_layers_5_to_8.txt		Layers 5–8		Assigns customer state (with persistence enforcement), generates intervention flags, monitors 								portfolio health (emits circuit breaker multiplier), writes governance log
+
+Real-Time Eligibility API
+Lender API call  ──▶  Feature Store  ──▶  Decision Engine  ──▶  Response
+
+File				Layer				What it does
+dim3_feature_store.txt		Dimension 3 — data serving	Hot/warm/cold in-memory store. Hot path refreshed every 15 min. Warm path updated per lender 								event. Cold path refreshed by daily batch.
+dim3_eligibility_api.txt	Dimension 3 — API		check_eligibility() and check_eligibility_batch(). Reads from feature store, runs decision engine, 							returns external-safe EligibilityResponse within 200ms p99.
+
+Lender Feedback Loop
+
+Lender submits report  ──▶  Validate  ──▶  Ingest  ──▶  Reconcile / Update / Compliance check
+
+
+File				Layer			What it does
+dim6_config.txt			Dimension 6 — config	All thresholds for feedback validation, outcome tracking, fairness monitoring, and explainability
+dim6_lender_feedback_api.txt	Dimension 6 — feedback	validate_lender_report → ingest_lender_report → reconcile_lender_vs_observed → 										compute_near_realtime_exposure_update → detect_lender_noncompliance
+dim6_outcome_tracking.txt	Dimension 6 — outcomes	store_decision_snapshot → compute_realised_outcomes → compute_calibration_metrics → 									compute_dsi_accuracy → compute_fairness_metrics → generate_all_explanations
+
+External Lender Interface
+
+final_capacity_df  ──▶  Strip internals  ──▶  MSISDN + CreditLimit only
+
+File				Layer		What it does
+external_lender_interface.txt	Layer 9		build_external_lender_interface() — removes all scores, states, reason codes, TNV components. Only MSISDN + 						CreditLimit (+ optional metadata) leave the system.
+
+Architecture Documentation
+
+File					Role
+solution_description.txt / README.md	Identical. Full 9-layer architecture description, design principles, and the core rule: lenders receive only MSISDN 					+ CreditLimit.
+
+
+Transactions.txt / Repayments.txt / disbursement.txt
+  (sample raw data)
+        │
+        ▼
+vw1  ──QA views──▶  vw2  ──▶  vw3  ──▶  vw4
+(classify)          (daily)    (features) (scores)
+        │                                   │
+        └───────────────────────────────────┘
+                          │
+                    Config.txt
+                          │
+                          ▼
+            run_credit_v1_decision_engine
+              (Layers 2-4: prefilter → TNV → capacity)
+                          │
+              Config_Layer_5_to_8.txt
+                          │
+                          ▼
+                 run_layers_5_to_8
+              (Layers 5-8: state → intervention
+               → portfolio → governance)
+                          │
+                ┌─────────┴──────────┐
+                │                    │
+                ▼                    ▼
+   dim3_feature_store        dim6_lender_feedback_api
+   dim3_eligibility_api      dim6_outcome_tracking
+   (real-time serving)       (feedback + calibration)
+                │                    │
+                └─────────┬──────────┘
+                           │
+               external_lender_interface
+               (MSISDN + CreditLimit only)
+                           │
+                           ▼
+                        Lenders
