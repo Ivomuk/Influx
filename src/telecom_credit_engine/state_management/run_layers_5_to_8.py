@@ -14,6 +14,62 @@ from tqdm import tqdm
 tqdm.pandas()
 
 # -----------------------------------------------------------------------
+# Configuration defaults — mirrors configs/Config_Layer_5_to_8.py.
+# Defined here so the module is self-contained and importable without
+# the configs/ directory on sys.path.
+# -----------------------------------------------------------------------
+
+STATE_ENGINE_CONFIG = {
+    'healthy_dsi_max': 35.0,
+    'at_risk_dsi_min': 36.0,
+    'at_risk_dsi_max': 59.0,
+    'distressed_dsi_min': 60.0,
+    'cooling_churn_threshold': 0.65,
+    'recovered_repayment_min': 0.75,
+    'recovered_dsi_max': 45.0,
+    'fraud_review_threshold': 0.80,
+    'restricted_actions': ['DECLINE', 'RESTRICT'],
+    'minimum_persistence_days_default': 7,
+    'minimum_persistence_days_restricted': 14,
+    'minimum_persistence_days_fraud_review': 14,
+    'enforce_minimum_persistence': True,
+    'dsi_hysteresis_days_for_upgrade': 3,
+}
+
+INTERVENTION_CONFIG = {
+    'wallet_drop_threshold': 0.40,
+    'dsi_rise_threshold': 15.0,
+    'missed_repayment_threshold': 0.25,
+    'repeat_borrowing_flag_value': 1,
+    'cooling_pattern_threshold': 0.65,
+    'recovery_probability_min': 0.70,
+}
+
+PORTFOLIO_CONFIG = {
+    'high_restrict_rate_threshold': 0.35,
+    'high_distressed_rate_threshold': 0.25,
+    'high_fraud_review_rate_threshold': 0.05,
+    'high_exposure_concentration_threshold': 0.40,
+    'high_stacked_borrowing_rate_threshold': 0.20,
+    'circuit_breaker_enabled': True,
+    'circuit_breaker_multipliers': {
+        'SYSTEM_WIDE_TIGHTENING':      0.60,
+        'DISTRESS_POSTURE_TIGHTENING': 0.70,
+        'FRAUD_PRESSURE_TIGHTENING':   0.65,
+        'EXPOSURE_CAP_REBALANCING':    0.75,
+        'STACKING_CAP_TIGHTENING':     0.80,
+        'STABLE_PORTFOLIO':            1.00,
+    },
+}
+
+GOVERNANCE_CONFIG = {
+    'decision_engine_version': 'credit_v1_python_decision_engine_prod',
+    'state_engine_version': 'credit_v1_state_engine_v1',
+    'oversight_queue_roles': 'risk_ops,collections_ops,governance_manager',
+    'manual_review_trigger_actions': 'RESTRICT,FRAUD_REVIEW,HIGH_VALUE_EDGE_CASE',
+}
+
+# -----------------------------------------------------------------------
 # State engine helpers
 # -----------------------------------------------------------------------
 
@@ -443,20 +499,19 @@ def run_layers_5_to_8(
         'portfolio_control_signal': cb_signal,
     }
 
-# -----------------------------------------------------------------------
-# Execute on in-memory outputs from the decision engine run above.
-# -----------------------------------------------------------------------
-layer_5_to_8_outputs = run_layers_5_to_8(
-    vw7_credit_v1_policy_prefilter,
-    vw9_credit_v1_final_capacity_output
-)
-state_df = layer_5_to_8_outputs['state_df']
-intervention_df = layer_5_to_8_outputs['intervention_df']
-portfolio_monitor_df = layer_5_to_8_outputs['portfolio_monitor_df']
-governance_log_df = layer_5_to_8_outputs['governance_log_df']
+if __name__ == '__main__':
+    # Dev/notebook entry point — requires vw7 and vw9 DataFrames in scope.
+    layer_5_to_8_outputs = run_layers_5_to_8(
+        vw7_credit_v1_policy_prefilter,
+        vw9_credit_v1_final_capacity_output
+    )
+    state_df = layer_5_to_8_outputs['state_df']
+    intervention_df = layer_5_to_8_outputs['intervention_df']
+    portfolio_monitor_df = layer_5_to_8_outputs['portfolio_monitor_df']
+    governance_log_df = layer_5_to_8_outputs['governance_log_df']
 
-print(state_df)
-print(intervention_df)
-print(portfolio_monitor_df[['feature_dt', 'portfolio_control_signal', 'circuit_breaker_capacity_multiplier']])
-print(governance_log_df[['feature_dt', 'subscriber_msisdn', 'operating_state', 'selected_action',
-                           'CreditLimit', 'persistence_block_applied', 'audit_trigger_flag']])
+    print(state_df)
+    print(intervention_df)
+    print(portfolio_monitor_df[['feature_dt', 'portfolio_control_signal', 'circuit_breaker_capacity_multiplier']])
+    print(governance_log_df[['feature_dt', 'subscriber_msisdn', 'operating_state', 'selected_action',
+                               'CreditLimit', 'persistence_block_applied', 'audit_trigger_flag']])

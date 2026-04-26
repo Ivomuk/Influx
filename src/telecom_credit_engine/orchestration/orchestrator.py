@@ -30,17 +30,17 @@ import pandas as pd
 import time
 from datetime import datetime, timezone
 
-from run_credit_v1_decision_engine import run_credit_v1_decision_engine, DECISION_ENGINE_CONFIG, ACTION_SPECS_DF
-from run_layers_5_to_8 import run_layers_5_to_8, STATE_ENGINE_CONFIG, INTERVENTION_CONFIG, PORTFOLIO_CONFIG, GOVERNANCE_CONFIG
-from dim3_feature_store import load_from_batch_output, write_hot_features, get_store_health
-from dim6_outcome_tracking import run_dim6_outcome_tracking
-from dim6_lender_feedback_api import run_lender_feedback_pipeline
-from qa_decision_engine_output import run_qa_decision_engine_output
-from qa_api_output_contract import run_qa_api_and_states
-from data_contracts import validate_all_pipeline_inputs
-from run_certification import run_certification, assert_certified
-from operating_modes import detect_operating_mode, apply_operating_mode_overrides, build_mode_log_entry
-from decision_replay import replay_decisions, diff_decisions
+from telecom_credit_engine.decisioning.run_credit_v1_decision_engine import run_credit_v1_decision_engine, DECISION_ENGINE_CONFIG, ACTION_SPECS_DF
+from telecom_credit_engine.state_management.run_layers_5_to_8 import run_layers_5_to_8, STATE_ENGINE_CONFIG, INTERVENTION_CONFIG, PORTFOLIO_CONFIG, GOVERNANCE_CONFIG
+from telecom_credit_engine.feature_store.dim3_feature_store import load_from_batch_output, write_hot_features, get_store_health
+from telecom_credit_engine.monitoring.dim6_outcome_tracking import run_dim6_outcome_tracking
+from telecom_credit_engine.interfaces.dim6_lender_feedback_api import run_lender_feedback_pipeline
+from telecom_credit_engine.monitoring.qa_decision_engine_output import run_qa_decision_engine_output
+from telecom_credit_engine.monitoring.qa_api_output_contract import run_qa_api_and_states
+from telecom_credit_engine.contracts.data_contracts import validate_all_pipeline_inputs
+from telecom_credit_engine.orchestration.run_certification import run_certification, assert_certified
+from telecom_credit_engine.governance.operating_modes import detect_operating_mode, apply_operating_mode_overrides, build_mode_log_entry
+from telecom_credit_engine.governance.decision_replay import replay_decisions, diff_decisions
 
 # ---------------------------------------------------------------------------
 # Persistent cross-cycle state (held in memory between runs; persist to

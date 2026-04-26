@@ -70,5 +70,6 @@ GOVERNANCE_CONFIG = {
     'manual_review_trigger_actions': 'RESTRICT,FRAUD_REVIEW,HIGH_VALUE_EDGE_CASE'
 }
 
-print(pd.Series(STATE_ENGINE_CONFIG))
-print(pd.Series(INTERVENTION_CONFIG))
+if __name__ == '__main__':
+    print(pd.Series(STATE_ENGINE_CONFIG))
+    print(pd.Series(INTERVENTION_CONFIG))
