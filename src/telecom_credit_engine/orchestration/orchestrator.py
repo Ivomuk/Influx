@@ -96,7 +96,7 @@ def run_sql_qa_gates(layer1_df, layer0_df, vw5_df=None, vw6_df=None):
     Validates schema contracts on all SQL outputs, then runs structural QA checks.
     Raises ContractViolationError or RuntimeError if any critical check fails.
     """
-    from data_contracts import validate_all_pipeline_inputs, ContractViolationError
+    from telecom_credit_engine.contracts.data_contracts import validate_all_pipeline_inputs, ContractViolationError
 
     print(f'[{_now()}] Running data contract validation.')
     validate_all_pipeline_inputs(layer1_df, layer0_df, vw5_df, vw6_df, strict=True)
@@ -130,8 +130,8 @@ def run_decision_engine_step(layer1_df, layer0_df, vw5_df, vw6_df,
     """
     global _previous_capacity_df, _circuit_breaker_multiplier, _current_operating_mode
 
-    from operating_modes import detect_operating_mode, apply_operating_mode_overrides, build_mode_log_entry
-    from dim3_feature_store import get_store_health
+    from telecom_credit_engine.governance.operating_modes import detect_operating_mode, apply_operating_mode_overrides, build_mode_log_entry
+    from telecom_credit_engine.feature_store.dim3_feature_store import get_store_health
 
     # Detect mode from current signals before running the engine.
     cert_passed = (_last_certification_report is None or _last_certification_report.get('certified', True))
@@ -392,8 +392,8 @@ def handle_lender_feedback_event(raw_report_df, observed_events_df,
     Updates the warm feature path so the eligibility API reflects the new exposure
     without waiting for the next batch run.
     """
-    from dim6_lender_feedback_api import run_lender_feedback_pipeline
-    from dim3_feature_store import write_warm_features
+    from telecom_credit_engine.interfaces.dim6_lender_feedback_api import run_lender_feedback_pipeline
+    from telecom_credit_engine.feature_store.dim3_feature_store import write_warm_features
 
     feedback_outputs = run_lender_feedback_pipeline(
         raw_report_df, observed_events_df, current_exposure_df,
