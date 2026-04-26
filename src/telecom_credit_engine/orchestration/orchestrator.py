@@ -43,8 +43,14 @@ from telecom_credit_engine.governance.operating_modes import detect_operating_mo
 from telecom_credit_engine.governance.decision_replay import replay_decisions, diff_decisions
 
 # ---------------------------------------------------------------------------
-# Persistent cross-cycle state (held in memory between runs; persist to
-# storage in production so restarts do not lose state).
+# Persistent cross-cycle state.
+#
+# WARNING: These process-level globals are a single-process stub. They work
+# correctly for sequential daily batch runs within a single Python process but
+# are NOT safe under horizontal scaling or process restarts. In production,
+# replace persist_cross_cycle_state() / load_cross_cycle_state() stubs with
+# reads/writes to durable storage (e.g. GCS, S3, or a database) so that state
+# survives restarts and is shared across workers.
 # ---------------------------------------------------------------------------
 _previous_capacity_df = None        # stability smoothing: CreditLimit from prior run
 _prior_state_df = None              # persistence enforcement: state + state_change_dt
@@ -364,7 +370,7 @@ def run_batch_pipeline(
         previous_capacity_df=_previous_capacity_df,
         pipeline_run_id=f'batch_{execution_date}',
     )
-    assert_certified(_last_certification_report, halt_on_failure=False)
+    assert_certified(_last_certification_report, halt_on_failure=True)
 
     # Step 8: Persist cross-cycle state
     persist_cross_cycle_state(execution_date)

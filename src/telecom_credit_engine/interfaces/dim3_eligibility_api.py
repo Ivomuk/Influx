@@ -20,10 +20,6 @@ import numpy as np
 import time
 from datetime import datetime, timezone
 
-# Imported from their respective modules in production.
-# In this file they are referenced by name; wire up actual imports at deploy time.
-# from dim3_feature_store import read_features, read_features_batch
-# from run_credit_v1_decision_engine import run_credit_v1_decision_engine, DECISION_ENGINE_CONFIG, ACTION_SPECS_DF
 
 # ---------------------------------------------------------------------------
 # API configuration
