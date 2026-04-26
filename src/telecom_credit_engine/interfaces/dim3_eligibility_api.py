@@ -89,7 +89,7 @@ def _run_single_subscriber_decision(features_dict, config_dict, action_specs_df,
         }])
 
     # Inline import to avoid circular dependency in production.
-    from run_credit_v1_decision_engine import run_credit_v1_decision_engine
+    from telecom_credit_engine.decisioning.run_credit_v1_decision_engine import run_credit_v1_decision_engine
     outputs = run_credit_v1_decision_engine(
         layer1_df, layer0_df,
         config_dict=config_dict,
@@ -128,7 +128,7 @@ def check_eligibility(msisdn, config_dict=None, previous_credit_limit=None):
     # ------------------------------------------------------------------
     t0 = time.perf_counter()
     try:
-        from dim3_feature_store import read_features
+        from telecom_credit_engine.feature_store.dim3_feature_store import read_features
         features_dict, path_used, age_min, is_stale = read_features(
             msisdn, allow_stale=True,
             stale_threshold_minutes=api_config['stale_path_threshold_minutes']
@@ -153,7 +153,7 @@ def check_eligibility(msisdn, config_dict=None, previous_credit_limit=None):
     # ------------------------------------------------------------------
     t1 = time.perf_counter()
     try:
-        from run_credit_v1_decision_engine import ACTION_SPECS_DF
+        from telecom_credit_engine.decisioning.run_credit_v1_decision_engine import ACTION_SPECS_DF
         decision = _run_single_subscriber_decision(
             features_dict, local_config, ACTION_SPECS_DF, previous_credit_limit
         )
@@ -222,7 +222,7 @@ def check_eligibility_batch(msisdn_list, config_dict=None, previous_capacity_df=
     # ------------------------------------------------------------------
     # Step 1: Bulk feature read
     # ------------------------------------------------------------------
-    from dim3_feature_store import read_features_batch
+    from telecom_credit_engine.feature_store.dim3_feature_store import read_features_batch
     features_df = read_features_batch(
         msisdn_list, allow_stale=True,
         stale_threshold_minutes=api_config['stale_path_threshold_minutes']
@@ -251,7 +251,7 @@ def check_eligibility_batch(msisdn_list, config_dict=None, previous_capacity_df=
     # ------------------------------------------------------------------
     if not data_df.empty:
         try:
-            from run_credit_v1_decision_engine import run_credit_v1_decision_engine, ACTION_SPECS_DF
+            from telecom_credit_engine.decisioning.run_credit_v1_decision_engine import run_credit_v1_decision_engine, ACTION_SPECS_DF
 
             layer1_cols = [
                 'feature_dt', 'subscriber_msisdn', 'outstanding_exposure_amt',
@@ -326,7 +326,7 @@ def check_eligibility_batch(msisdn_list, config_dict=None, previous_capacity_df=
 if __name__ == '__main__':
     # Dev/notebook entry point — requires layer1_df and layer0_df in scope.
     # In production replace with a proper service entry point.
-    from dim3_feature_store import load_from_batch_output, get_store_health
+    from telecom_credit_engine.feature_store.dim3_feature_store import load_from_batch_output, get_store_health
 
     load_from_batch_output(layer1_df, layer0_df)
     print(get_store_health())

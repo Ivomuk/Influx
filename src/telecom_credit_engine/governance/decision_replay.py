@@ -65,7 +65,7 @@ def replay_decisions(
     Returns vw9_credit_v1_final_capacity_output with an added replay_dt column.
     Passing a different config_dict enables counterfactual / what-if analysis.
     """
-    from run_credit_v1_decision_engine import (
+    from telecom_credit_engine.decisioning.run_credit_v1_decision_engine import (
         run_credit_v1_decision_engine, DECISION_ENGINE_CONFIG, ACTION_SPECS_DF
     )
 
