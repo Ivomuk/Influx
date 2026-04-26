@@ -1,6 +1,5 @@
 # Wrap the external lender payload into a reusable production-style function and verify it on the in-memory final output.
 import pandas as pd
-from IPython.display import display
 
 def build_external_lender_interface(final_capacity_df, include_optional_fields=True, decision_timestamp=None, policy_version_col='output_version'):
     required_cols = ['subscriber_msisdn', 'CreditLimit']
@@ -28,8 +27,9 @@ def build_external_lender_interface(final_capacity_df, include_optional_fields=T
     lender_interface_df = lender_interface_df.sort_values(['MSISDN']).reset_index(drop=True)
     return lender_interface_df
 
-required_output_df = build_external_lender_interface(vw9_credit_v1_final_capacity_output, include_optional_fields=False, decision_timestamp='2026-04-23')
-optional_output_df = build_external_lender_interface(vw9_credit_v1_final_capacity_output, include_optional_fields=True, decision_timestamp='2026-04-23')
-
-print(required_output_df)
-print(optional_output_df)
+if __name__ == '__main__':
+    # Dev/notebook entry point — requires vw9_credit_v1_final_capacity_output in scope.
+    required_output_df = build_external_lender_interface(vw9_credit_v1_final_capacity_output, include_optional_fields=False, decision_timestamp='2026-04-23')
+    optional_output_df = build_external_lender_interface(vw9_credit_v1_final_capacity_output, include_optional_fields=True, decision_timestamp='2026-04-23')
+    print(required_output_df)
+    print(optional_output_df)
