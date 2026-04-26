@@ -28,8 +28,20 @@ def build_external_lender_interface(final_capacity_df, include_optional_fields=T
     return lender_interface_df
 
 if __name__ == '__main__':
-    # Dev/notebook entry point — requires vw9_credit_v1_final_capacity_output in scope.
-    required_output_df = build_external_lender_interface(vw9_credit_v1_final_capacity_output, include_optional_fields=False, decision_timestamp='2026-04-23')
-    optional_output_df = build_external_lender_interface(vw9_credit_v1_final_capacity_output, include_optional_fields=True, decision_timestamp='2026-04-23')
+    # Self-contained smoke test — synthetic data matching the required schema.
+    sample_df = pd.DataFrame({
+        'subscriber_msisdn': ['256700000001', '256700000002', '256700000003'],
+        'CreditLimit':       [10000.0,        5000.0,         0.0],
+        'output_version':    ['credit_v1_prod'] * 3,
+        'validity_days':     [14, 7, 7],
+    })
+    required_output_df = build_external_lender_interface(
+        sample_df, include_optional_fields=False, decision_timestamp='2026-04-23'
+    )
+    optional_output_df = build_external_lender_interface(
+        sample_df, include_optional_fields=True, decision_timestamp='2026-04-23'
+    )
+    print('--- required fields only ---')
     print(required_output_df)
+    print('--- with optional fields ---')
     print(optional_output_df)

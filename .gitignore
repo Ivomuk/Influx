@@ -18,9 +18,9 @@ build/
 venv/
 env/
 
-# Jupyter
+# Jupyter — checkpoints only; notebooks themselves are tracked
 .ipynb_checkpoints/
-*.ipynb
+# scratch notebooks ignored via notebooks/scratch/.gitignore
 
 # Generated runtime outputs — not source
 outputs/
