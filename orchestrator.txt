@@ -30,18 +30,17 @@ import pandas as pd
 import time
 from datetime import datetime, timezone
 
-# In production these are imported from their respective modules.
-# from run_credit_v1_decision_engine import run_credit_v1_decision_engine, DECISION_ENGINE_CONFIG, ACTION_SPECS_DF
-# from run_layers_5_to_8 import run_layers_5_to_8, STATE_ENGINE_CONFIG, INTERVENTION_CONFIG, PORTFOLIO_CONFIG, GOVERNANCE_CONFIG
-# from dim3_feature_store import load_from_batch_output, write_hot_features, get_store_health
-# from dim6_outcome_tracking import run_dim6_outcome_tracking
-# from dim6_lender_feedback_api import run_lender_feedback_pipeline
-# from qa_decision_engine_output import run_qa_decision_engine_output
-# from qa_api_output_contract import run_qa_api_and_states
-# from data_contracts import validate_all_pipeline_inputs
-# from run_certification import run_certification, assert_certified
-# from operating_modes import detect_operating_mode, apply_operating_mode_overrides, build_mode_log_entry
-# from decision_replay import replay_decisions, diff_decisions
+from run_credit_v1_decision_engine import run_credit_v1_decision_engine, DECISION_ENGINE_CONFIG, ACTION_SPECS_DF
+from run_layers_5_to_8 import run_layers_5_to_8, STATE_ENGINE_CONFIG, INTERVENTION_CONFIG, PORTFOLIO_CONFIG, GOVERNANCE_CONFIG
+from dim3_feature_store import load_from_batch_output, write_hot_features, get_store_health
+from dim6_outcome_tracking import run_dim6_outcome_tracking
+from dim6_lender_feedback_api import run_lender_feedback_pipeline
+from qa_decision_engine_output import run_qa_decision_engine_output
+from qa_api_output_contract import run_qa_api_and_states
+from data_contracts import validate_all_pipeline_inputs
+from run_certification import run_certification, assert_certified
+from operating_modes import detect_operating_mode, apply_operating_mode_overrides, build_mode_log_entry
+from decision_replay import replay_decisions, diff_decisions
 
 # ---------------------------------------------------------------------------
 # Persistent cross-cycle state (held in memory between runs; persist to
@@ -69,22 +68,23 @@ def run_sql_batch_pipeline(execution_date):
     """
     print(f'[{_now()}] SQL batch pipeline starting for {execution_date}')
 
-    # In production: submit each query and wait for completion before next.
-    # query_engine.run('vw1_credit_v1_normalized_events', date=execution_date)
-    # query_engine.run('vw2_credit_v1_subscriber_day', date=execution_date)
-    # query_engine.run('vw3_credit_v1_layer1_features', date=execution_date)
-    # query_engine.run('vw4_credit_v1_layer0_scores', date=execution_date)
-    # query_engine.run('vw5_credit_v1_reason_codes', date=execution_date)
-    # query_engine.run('vw6_credit_v1_cap_and_action', date=execution_date)
-
-    # layer1_df = query_engine.read('vw3_credit_v1_layer1_features')
-    # layer0_df = query_engine.read('vw4_credit_v1_layer0_scores')
-    # vw5_df = query_engine.read('vw5_credit_v1_reason_codes')
-    # vw6_df = query_engine.read('vw6_credit_v1_cap_and_action')
-
-    # Placeholder: in notebook/dev context these DataFrames are already in memory.
-    print(f'[{_now()}] SQL pipeline complete.')
-    return layer1_df, layer0_df, vw5_df, vw6_df
+    # Wire up query_engine (BigQuery client or equivalent) before calling this.
+    # Each view must complete before the next starts (strict dependency order).
+    raise NotImplementedError(
+        'run_sql_batch_pipeline: provide a query_engine implementation. '
+        'Expected pattern:\n'
+        '  query_engine.run("vw1_credit_v1_normalized_events", date=execution_date)\n'
+        '  query_engine.run("vw2_credit_v1_subscriber_day",    date=execution_date)\n'
+        '  query_engine.run("vw3_credit_v1_layer1_features",   date=execution_date)\n'
+        '  query_engine.run("vw4_credit_v1_layer0_scores",     date=execution_date)\n'
+        '  query_engine.run("vw5_credit_v1_reason_codes",      date=execution_date)\n'
+        '  query_engine.run("vw6_credit_v1_cap_and_action",    date=execution_date)\n'
+        '  layer1_df = query_engine.read("vw3_credit_v1_layer1_features")\n'
+        '  layer0_df = query_engine.read("vw4_credit_v1_layer0_scores")\n'
+        '  vw5_df    = query_engine.read("vw5_credit_v1_reason_codes")\n'
+        '  vw6_df    = query_engine.read("vw6_credit_v1_cap_and_action")\n'
+        '  return layer1_df, layer0_df, vw5_df, vw6_df'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +306,6 @@ def run_batch_pipeline(
     Returns a dict of all outputs for downstream inspection or storage.
     """
     global _previous_capacity_df
-    from run_certification import run_certification, assert_certified
 
     t_start = time.perf_counter()
     print(f'\n{"="*60}')

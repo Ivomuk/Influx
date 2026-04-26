@@ -6,7 +6,7 @@
 import pandas as pd
 import numpy as np
 
-VALID_DECISION_STATUSES_API = {'approved_or_maintained', 'blocked_or_restricted', 'NO_DATA', 'ENGINE_ERROR'}
+VALID_DECISION_STATUSES_API = {'approved_or_maintained', 'blocked_or_restricted', 'declined', 'NO_DATA', 'ENGINE_ERROR'}
 VALID_OPERATING_STATES = {'Healthy', 'At Risk', 'Distressed', 'Cooling Off', 'Recovered', 'Restricted', 'Fraud Review'}
 LATENCY_SLA_MS = 200
 
@@ -62,6 +62,14 @@ def qa_eligibility_response(eligibility_df, latency_sla_ms=LATENCY_SLA_MS):
     no_data = df[df['decision_status'] == 'NO_DATA']
     results['QA-API-07_no_data_nonzero_limit'] = no_data[no_data['CreditLimit'] != 0][['MSISDN', 'CreditLimit']]
     _print_result('QA-API-07', results['QA-API-07_no_data_nonzero_limit'])
+
+    # QA-API-08: declined or blocked_or_restricted rows have non-zero CreditLimit
+    zero_limit_statuses = {'declined', 'blocked_or_restricted'}
+    restricted_rows = df[df['decision_status'].isin(zero_limit_statuses)]
+    results['QA-API-08_restricted_nonzero_limit'] = restricted_rows[
+        restricted_rows['CreditLimit'] > 0
+    ][['MSISDN', 'decision_status', 'CreditLimit']]
+    _print_result('QA-API-08', results['QA-API-08_restricted_nonzero_limit'])
 
     return results
 

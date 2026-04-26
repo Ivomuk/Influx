@@ -112,7 +112,9 @@ def check_eligibility(msisdn, config_dict=None, previous_credit_limit=None):
       validity_period_days  : how long this decision is valid
       decision_timestamp    : UTC timestamp of this decision
       policy_version        : version string for audit
-      decision_status       : approved_or_maintained | blocked_or_restricted | NO_DATA | ENGINE_ERROR
+      decision_status       : approved_or_maintained | blocked_or_restricted | declined | NO_DATA | ENGINE_ERROR
+                              declined            — DECLINE action (no prior credit or TNV ≤ 0)
+                              blocked_or_restricted — RESTRICT action (prior credit, now blocked)
       is_stale              : 1 if features were served from stale cache
       latency_ms            : end-to-end wall-clock time
     Internal fields (scores, states, reason codes) are NOT included.
@@ -321,21 +323,14 @@ def check_eligibility_batch(msisdn_list, config_dict=None, previous_capacity_df=
     return response_df
 
 
-# ---------------------------------------------------------------------------
-# Demonstration: load feature store from batch output and run batch check
-# ---------------------------------------------------------------------------
+if __name__ == '__main__':
+    # Dev/notebook entry point — requires layer1_df and layer0_df in scope.
+    # In production replace with a proper service entry point.
+    from dim3_feature_store import load_from_batch_output, get_store_health
 
-# In production this block is replaced by a proper service entry point.
-# Here it shows the intended usage pattern with the in-memory sample data.
+    load_from_batch_output(layer1_df, layer0_df)
+    print(get_store_health())
 
-from dim3_feature_store import load_from_batch_output, get_store_health
-
-# Bootstrap feature store from the SQL batch output already loaded in memory.
-load_from_batch_output(layer1_df, layer0_df)
-
-print(get_store_health())
-
-# Run batch eligibility for all subscribers in the sample.
-msisdn_list_sample = layer1_df['subscriber_msisdn'].tolist()
-eligibility_results_df = check_eligibility_batch(msisdn_list_sample)
-print(eligibility_results_df)
+    msisdn_list_sample = layer1_df['subscriber_msisdn'].tolist()
+    eligibility_results_df = check_eligibility_batch(msisdn_list_sample)
+    print(eligibility_results_df)

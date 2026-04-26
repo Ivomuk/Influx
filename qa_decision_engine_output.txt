@@ -8,7 +8,11 @@ import pandas as pd
 import numpy as np
 
 VALID_ACTIONS = {'DECLINE', 'RESTRICT', 'REDUCE', 'MAINTAIN', 'INCREASE_SMALL', 'INCREASE_MEDIUM'}
-VALID_DECISION_STATUSES = {'approved_or_maintained', 'blocked_or_restricted'}
+# Three-value status mirrors the action distinction partners need:
+#   declined            → DECLINE action (no prior credit or TNV ≤ 0); do not disburse
+#   blocked_or_restricted → RESTRICT action (prior credit, now blocked); manage existing exposure
+#   approved_or_maintained → all other actions; CreditLimit > 0
+VALID_DECISION_STATUSES = {'approved_or_maintained', 'blocked_or_restricted', 'declined'}
 VALID_REASON_CODES = {
     'LOW_IDENTITY_CONFIDENCE', 'HIGH_FRAUD_ABUSE_RISK', 'SEVERE_DSI',
     'RECENT_DISBURSEMENT_NO_REPAYMENT', 'TIMING_MANIPULATION_DETECTED',

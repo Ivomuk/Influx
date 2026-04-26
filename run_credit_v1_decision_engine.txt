@@ -391,10 +391,19 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
         best_df = best_df.drop(columns=['conservative_credit_limit_v1'])
 
     best_df['output_version'] = config_dict['output_version']
-    best_df['decision_status'] = np.where(
-        best_df['selected_action'].isin(['DECLINE', 'RESTRICT']),
-        'blocked_or_restricted',
-        'approved_or_maintained'
+    # Three-value status so downstream systems can distinguish:
+    #   declined            — no credit granted (TNV ≤ 0 or first-time reject);
+    #                         lender should not disburse
+    #   blocked_or_restricted — existing credit relationship now blocked;
+    #                         lender must also manage outstanding exposure
+    #   approved_or_maintained — CreditLimit > 0, lending permitted
+    best_df['decision_status'] = np.select(
+        [
+            best_df['selected_action'] == 'DECLINE',
+            best_df['selected_action'] == 'RESTRICT',
+        ],
+        ['declined', 'blocked_or_restricted'],
+        default='approved_or_maintained'
     )
 
     final_cols = [
@@ -455,12 +464,13 @@ def run_credit_v1_decision_engine(
         'vw9_credit_v1_final_capacity_output': final_capacity_df
     }
 
-# Execute on already loaded sample data.
-engine_outputs = run_credit_v1_decision_engine(layer1_df, layer0_df)
-vw7_credit_v1_policy_prefilter = engine_outputs['vw7_credit_v1_policy_prefilter']
-vw8_credit_v1_tnv_action_evaluation = engine_outputs['vw8_credit_v1_tnv_action_evaluation']
-vw9_credit_v1_final_capacity_output = engine_outputs['vw9_credit_v1_final_capacity_output']
+if __name__ == '__main__':
+    # Dev/notebook entry point — requires layer1_df and layer0_df in scope.
+    engine_outputs = run_credit_v1_decision_engine(layer1_df, layer0_df)
+    vw7_credit_v1_policy_prefilter = engine_outputs['vw7_credit_v1_policy_prefilter']
+    vw8_credit_v1_tnv_action_evaluation = engine_outputs['vw8_credit_v1_tnv_action_evaluation']
+    vw9_credit_v1_final_capacity_output = engine_outputs['vw9_credit_v1_final_capacity_output']
 
-print(vw7_credit_v1_policy_prefilter[['feature_dt', 'subscriber_msisdn', 'primary_policy_reason', 'feasible_action_set']])
-print(vw8_credit_v1_tnv_action_evaluation.head())
-print(vw9_credit_v1_final_capacity_output)
+    print(vw7_credit_v1_policy_prefilter[['feature_dt', 'subscriber_msisdn', 'primary_policy_reason', 'feasible_action_set']])
+    print(vw8_credit_v1_tnv_action_evaluation.head())
+    print(vw9_credit_v1_final_capacity_output)
