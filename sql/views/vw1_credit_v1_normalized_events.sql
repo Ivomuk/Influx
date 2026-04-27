@@ -72,7 +72,6 @@ base_events AS (
 
             -- Alternative credit signal (third-party credit product usage)
             WHEN service_name = 'MoMo advance' AND sub_service_name = 'Access Fee (MoMo advance)' THEN 'alt_credit_signal'
-            WHEN service_name IN ('XtraCash', 'Jumo')                                              THEN 'alt_credit_signal'
 
             ELSE 'other_non_loan'
         END AS event_family,
@@ -108,7 +107,6 @@ base_events AS (
 
             -- Alt credit signal
             WHEN service_name = 'MoMo advance' AND sub_service_name = 'Access Fee (MoMo advance)' THEN COALESCE(to_msisdn, from_msisdn)
-            WHEN service_name IN ('XtraCash', 'Jumo')                                              THEN COALESCE(to_msisdn, from_msisdn)
 
             ELSE COALESCE(to_msisdn, from_msisdn)
         END AS subscriber_msisdn,
@@ -164,7 +162,6 @@ base_events AS (
 
         CASE
             WHEN service_name = 'MoMo advance' AND sub_service_name = 'Access Fee (MoMo advance)' THEN 1
-            WHEN service_name IN ('XtraCash', 'Jumo')                                              THEN 1
             ELSE 0
         END AS alt_credit_signal_flag,
 
