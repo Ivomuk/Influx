@@ -1,5 +1,4 @@
 import pandas as pd
-import prestodb
 
 
 def make_query_client(host, port, user, password,
@@ -16,6 +15,7 @@ def make_query_client(host, port, user, password,
     schema      : default schema / Hive database (default 'credit_engine')
     http_scheme : 'https' for TLS (production), 'http' for local/dev
     """
+    import prestodb
     conn = prestodb.dbapi.connect(
         host=host,
         port=int(port),
