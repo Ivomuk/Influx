@@ -4,8 +4,8 @@
 #
 # SQL QA suites (vw1–vw4): each check is a SQL query expected to return
 # zero rows. Pass the SQL text as a dict {check_name: sql_text} sourced
-# from the qa_vw*.txt files. A bq_client (BigQuery client or compatible
-# adapter with .query(sql).to_dataframe()) must be supplied.
+# from the qa_vw*.txt files. A PrestoQueryClient (from presto_client.py,
+# with .query(sql).to_dataframe()) must be supplied as query_client.
 #
 # Python QA suites: called directly against in-memory DataFrames using
 # the existing qa_decision_engine_output and qa_api_output_contract modules.
@@ -23,9 +23,9 @@ from datetime import datetime, timezone
 # SQL QA execution
 # ---------------------------------------------------------------------------
 
-def _run_sql_check(sql_text, check_name, bq_client):
+def _run_sql_check(sql_text, check_name, query_client):
     try:
-        result_df = bq_client.query(sql_text).to_dataframe()
+        result_df = query_client.query(sql_text).to_dataframe()
         fail_count = len(result_df)
         status = 'PASS' if fail_count == 0 else 'FAIL'
         if fail_count > 0:
@@ -36,9 +36,9 @@ def _run_sql_check(sql_text, check_name, bq_client):
         return {'check_name': check_name, 'status': 'ERROR', 'fail_count': None, 'error': str(exc)}
 
 
-def _run_sql_suite(suite_name, sql_checks_dict, bq_client):
+def _run_sql_suite(suite_name, sql_checks_dict, query_client):
     print(f'\n--- SQL QA: {suite_name} ---')
-    return [_run_sql_check(sql, name, bq_client) for name, sql in sql_checks_dict.items()]
+    return [_run_sql_check(sql, name, query_client) for name, sql in sql_checks_dict.items()]
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ def _build_report(all_results, execution_dt, pipeline_run_id):
 
 def run_certification(
     # SQL QA inputs — dicts of {check_name: sql_text} from the qa_vw*.txt files
-    bq_client,
+    query_client,
     sql_qa_vw1_checks,
     sql_qa_vw2_checks,
     sql_qa_vw3_checks,
@@ -126,21 +126,21 @@ def run_certification(
     all_results = []
 
     # SQL QA — vw1 through vw4 in dependency order
-    all_results += _run_sql_suite('vw1_normalized_events', sql_qa_vw1_checks, bq_client)
-    all_results += _run_sql_suite('vw2_subscriber_day',    sql_qa_vw2_checks, bq_client)
-    all_results += _run_sql_suite('vw3_layer1_features',   sql_qa_vw3_checks, bq_client)
-    all_results += _run_sql_suite('vw4_layer0_scores',     sql_qa_vw4_checks, bq_client)
+    all_results += _run_sql_suite('vw1_normalized_events', sql_qa_vw1_checks, query_client)
+    all_results += _run_sql_suite('vw2_subscriber_day',    sql_qa_vw2_checks, query_client)
+    all_results += _run_sql_suite('vw3_layer1_features',   sql_qa_vw3_checks, query_client)
+    all_results += _run_sql_suite('vw4_layer0_scores',     sql_qa_vw4_checks, query_client)
 
     # Python QA — decision engine
     print('\n--- Python QA: decision_engine ---')
-    from qa_decision_engine_output import run_qa_decision_engine_output
+    from telecom_credit_engine.monitoring.qa_decision_engine_output import run_qa_decision_engine_output
     all_results += _python_qa_to_rows(
         run_qa_decision_engine_output(engine_outputs, config_dict, previous_capacity_df)
     )
 
     # Python QA — API output contract
     print('\n--- Python QA: api_output_contract ---')
-    from qa_api_output_contract import run_qa_api_and_states
+    from telecom_credit_engine.monitoring.qa_api_output_contract import run_qa_api_and_states
     all_results += _python_qa_to_rows(run_qa_api_and_states(eligibility_df, state_df))
 
     return _build_report(all_results, execution_dt, pipeline_run_id)

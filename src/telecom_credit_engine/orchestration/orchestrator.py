@@ -26,6 +26,7 @@
 #   state_df             -> next run as prior_state_df (persistence enforcement)
 #   circuit_breaker_multiplier -> next run applied to policy_capacity_cap
 
+import json
 import pandas as pd
 import time
 from datetime import datetime, timezone
@@ -252,28 +253,91 @@ def run_outcome_tracking_step(engine_outputs, layer0_df, layer1_df,
 
 
 # ---------------------------------------------------------------------------
-# Step 7: Save cross-cycle state to durable storage
-# In production: write _previous_capacity_df and _prior_state_df to
-# a managed store (S3/Delta/database) so the orchestrator can resume
-# after a restart without losing stability or persistence context.
+# Step 7: Persist / load cross-cycle state via Hive (Presto)
+# Tables are created by deployment/hive_state_tables.sql (run once).
+# Each daily run appends one partition (run_date = 'YYYY-MM-DD').
+# Load always reads MAX(run_date) so it picks up the most recent run
+# regardless of the date passed in.
 # ---------------------------------------------------------------------------
 
-def persist_cross_cycle_state(run_date):
-    """Stub: write cross-cycle state to durable storage."""
-    global _previous_capacity_df, _prior_state_df, _circuit_breaker_multiplier
-    # production_store.write(f'previous_capacity/{run_date}', _previous_capacity_df)
-    # production_store.write(f'prior_state/{run_date}', _prior_state_df)
-    # production_store.write(f'circuit_breaker/{run_date}', {'multiplier': _circuit_breaker_multiplier})
+def persist_cross_cycle_state(run_date, query_client):
+    """Write cross-cycle state to Hive via Presto for the given run_date."""
+    global _previous_capacity_df, _prior_state_df, _circuit_breaker_multiplier, \
+           _current_operating_mode, _last_certification_report
+
+    if _previous_capacity_df is not None and not _previous_capacity_df.empty:
+        query_client.insert_rows(
+            'credit_engine.pipeline_capacity_state',
+            ['subscriber_msisdn', 'credit_limit', 'run_date'],
+            [
+                (row.subscriber_msisdn, row.CreditLimit, run_date)
+                for row in _previous_capacity_df.itertuples(index=False)
+            ],
+        )
+
+    if _prior_state_df is not None and not _prior_state_df.empty:
+        query_client.insert_rows(
+            'credit_engine.pipeline_subscriber_state',
+            ['subscriber_msisdn', 'operating_state', 'state_change_dt', 'run_date'],
+            [
+                (row.subscriber_msisdn, row.operating_state,
+                 pd.Timestamp(row.state_change_dt), run_date)
+                for row in _prior_state_df.itertuples(index=False)
+            ],
+        )
+
+    cert_passed = bool(_last_certification_report.get('certified', False)) \
+        if _last_certification_report else False
+    cert_summary = json.dumps({
+        k: v for k, v in _last_certification_report.items() if k != 'details'
+    }) if _last_certification_report else '{}'
+
+    query_client.insert_rows(
+        'credit_engine.pipeline_run_metadata',
+        ['circuit_breaker_multiplier', 'operating_mode',
+         'certification_passed', 'certification_summary', 'run_date'],
+        [(_circuit_breaker_multiplier, _current_operating_mode,
+          cert_passed, cert_summary, run_date)],
+    )
     print(f'[{_now()}] Cross-cycle state persisted for {run_date}.')
 
 
-def load_cross_cycle_state(run_date):
-    """Stub: restore cross-cycle state from durable storage on restart."""
-    global _previous_capacity_df, _prior_state_df, _circuit_breaker_multiplier
-    # _previous_capacity_df = production_store.read(f'previous_capacity/{run_date}')
-    # _prior_state_df = production_store.read(f'prior_state/{run_date}')
-    # _circuit_breaker_multiplier = production_store.read(f'circuit_breaker/{run_date}')['multiplier']
-    print(f'[{_now()}] Cross-cycle state loaded for {run_date}.')
+def load_cross_cycle_state(query_client):
+    """Restore cross-cycle state from Hive using the most recent available run_date.
+    Call once at process startup before the first run_batch_pipeline invocation."""
+    global _previous_capacity_df, _prior_state_df, _circuit_breaker_multiplier, \
+           _current_operating_mode
+
+    cap_df = query_client.query(
+        'SELECT subscriber_msisdn, credit_limit '
+        'FROM credit_engine.pipeline_capacity_state '
+        'WHERE run_date = (SELECT MAX(run_date) FROM credit_engine.pipeline_capacity_state)'
+    ).to_dataframe()
+
+    state_df = query_client.query(
+        'SELECT subscriber_msisdn, operating_state, state_change_dt '
+        'FROM credit_engine.pipeline_subscriber_state '
+        'WHERE run_date = (SELECT MAX(run_date) FROM credit_engine.pipeline_subscriber_state)'
+    ).to_dataframe()
+
+    meta_df = query_client.query(
+        'SELECT circuit_breaker_multiplier, operating_mode '
+        'FROM credit_engine.pipeline_run_metadata '
+        'WHERE run_date = (SELECT MAX(run_date) FROM credit_engine.pipeline_run_metadata)'
+    ).to_dataframe()
+
+    if not cap_df.empty:
+        _previous_capacity_df = cap_df.rename(columns={'credit_limit': 'CreditLimit'})
+
+    if not state_df.empty:
+        _prior_state_df = state_df.copy()
+        _prior_state_df['state_change_dt'] = pd.to_datetime(_prior_state_df['state_change_dt'])
+
+    if not meta_df.empty:
+        _circuit_breaker_multiplier = float(meta_df.iloc[0]['circuit_breaker_multiplier'])
+        _current_operating_mode     = str(meta_df.iloc[0]['operating_mode'])
+
+    print(f'[{_now()}] Cross-cycle state loaded from Hive.')
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +348,7 @@ def run_batch_pipeline(
     execution_date,
     lender_feedback_df,
     # Certification inputs (SQL QA check dicts sourced from qa_vw*.txt files)
-    bq_client=None,
+    query_client=None,
     sql_qa_vw1_checks=None,
     sql_qa_vw2_checks=None,
     sql_qa_vw3_checks=None,
@@ -358,7 +422,7 @@ def run_batch_pipeline(
     # Step 7: Certification — runs all QA suites and gates pipeline completion
     global _last_certification_report
     _last_certification_report = run_certification(
-        bq_client=bq_client,
+        query_client=query_client,
         sql_qa_vw1_checks=sql_qa_vw1_checks,
         sql_qa_vw2_checks=sql_qa_vw2_checks,
         sql_qa_vw3_checks=sql_qa_vw3_checks,
@@ -373,7 +437,7 @@ def run_batch_pipeline(
     assert_certified(_last_certification_report, halt_on_failure=True)
 
     # Step 8: Persist cross-cycle state
-    persist_cross_cycle_state(execution_date)
+    persist_cross_cycle_state(execution_date, query_client)
 
     elapsed = round((time.perf_counter() - t_start) / 60, 1)
     print(f'\n[{_now()}] Batch pipeline complete in {elapsed} min.')
