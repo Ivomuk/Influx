@@ -122,7 +122,7 @@ base_events AS (
         CASE
             WHEN lower(sub_service_name) LIKE '%disbursement%' THEN service_name
             WHEN lower(sub_service_name) LIKE '%repayment%'    THEN service_name
-            WHEN service_name IN ('MoMo advance', 'XtraCash', 'Jumo') THEN service_name
+            WHEN service_name IN ('MoPesa', 'Mokash', 'MoMo advance', 'XtraCash', 'Jumo') THEN service_name
             ELSE NULL
         END AS lender_family_v1,
 
