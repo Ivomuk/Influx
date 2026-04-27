@@ -26,7 +26,11 @@ aggregated AS (
         COUNT_IF(
             event_family IN ('wallet_outflow', 'spend_behavior')
             AND signed_amount >= 0
-        ) AS bad_wallet_outflow_sign_cnt
+        ) AS bad_wallet_outflow_sign_cnt,
+        COUNT_IF(
+            event_family = 'savings'
+            AND signed_amount >= 0
+        ) AS bad_savings_sign_cnt
     FROM base
     GROUP BY event_family
 )
@@ -37,6 +41,7 @@ SELECT
     bad_loan_disbursement_sign_cnt,
     bad_loan_repayment_sign_cnt,
     bad_wallet_inflow_sign_cnt,
-    bad_wallet_outflow_sign_cnt
+    bad_wallet_outflow_sign_cnt,
+    bad_savings_sign_cnt
 FROM aggregated
 ;
