@@ -255,75 +255,151 @@ def run_outcome_tracking_step(engine_outputs, layer0_df, layer1_df,
 # ---------------------------------------------------------------------------
 # Step 7: Persist / load cross-cycle state via Hive (Presto)
 # Tables are created by deployment/hive_state_tables.sql (run once).
-# Each daily run appends one partition (run_date = 'YYYY-MM-DD').
-# Load always reads MAX(run_date) so it picks up the most recent run
-# regardless of the date passed in.
+#
+# Atomicity: pipeline_commit_log is written LAST. load_cross_cycle_state
+# resolves the target run_date from the commit log, so a partial write
+# (where data inserts succeed but the commit write fails) is never loaded.
+#
+# Idempotency: if pipeline_run_id already appears in the commit log as
+# COMMITTED, persist_cross_cycle_state skips the write entirely.
 # ---------------------------------------------------------------------------
 
-def persist_cross_cycle_state(run_date, query_client):
-    """Write cross-cycle state to Hive via Presto for the given run_date."""
+VALID_OPERATING_STATES = frozenset({
+    'healthy', 'at_risk', 'distressed', 'recovered', 'cooling', 'fraud_review',
+})
+
+
+def _validate_state_df(state_df, context='persist'):
+    """Raise ValueError if state_df contains unknown operating_state values."""
+    if state_df is None or state_df.empty:
+        return
+    unknown = set(state_df['operating_state'].unique()) - VALID_OPERATING_STATES
+    if unknown:
+        raise ValueError(
+            f'load_cross_cycle_state [{context}]: unknown operating_state values: {unknown}. '
+            f'Valid: {sorted(VALID_OPERATING_STATES)}'
+        )
+
+
+def persist_cross_cycle_state(run_date, pipeline_run_id, query_client):
+    """Write cross-cycle state to Hive via Presto.
+
+    Idempotent: skips write if pipeline_run_id is already COMMITTED.
+    Atomic: pipeline_commit_log is written last; load never reads a
+    run_date that lacks a commit marker.
+    """
     global _previous_capacity_df, _prior_state_df, _circuit_breaker_multiplier, \
            _current_operating_mode, _last_certification_report
 
+    # --- Idempotency check -------------------------------------------------
+    existing = query_client.query(
+        f"SELECT COUNT(*) AS cnt FROM credit_engine.pipeline_commit_log "
+        f"WHERE run_date = '{run_date}' AND pipeline_run_id = '{pipeline_run_id}' "
+        f"AND write_status = 'COMMITTED'"
+    ).to_dataframe()
+    if not existing.empty and int(existing.iloc[0]['cnt']) > 0:
+        print(f'[{_now()}] State already committed for run_id={pipeline_run_id}; skipping.')
+        return
+
+    # --- Validate states before writing ------------------------------------
+    _validate_state_df(_prior_state_df, context='persist')
+
+    # --- Capacity state ----------------------------------------------------
     if _previous_capacity_df is not None and not _previous_capacity_df.empty:
+        cap_rows = [
+            (row.subscriber_msisdn, row.CreditLimit, pipeline_run_id, run_date)
+            for row in _previous_capacity_df.itertuples(index=False)
+        ]
         query_client.insert_rows(
             'credit_engine.pipeline_capacity_state',
-            ['subscriber_msisdn', 'credit_limit', 'run_date'],
-            [
-                (row.subscriber_msisdn, row.CreditLimit, run_date)
-                for row in _previous_capacity_df.itertuples(index=False)
-            ],
+            ['subscriber_msisdn', 'credit_limit', 'pipeline_run_id', 'run_date'],
+            cap_rows,
         )
+        # Row-count reconciliation: read back and verify
+        reconcile = query_client.query(
+            f"SELECT COUNT(*) AS cnt FROM credit_engine.pipeline_capacity_state "
+            f"WHERE run_date = '{run_date}' AND pipeline_run_id = '{pipeline_run_id}'"
+        ).to_dataframe()
+        written = int(reconcile.iloc[0]['cnt'])
+        expected = len(cap_rows)
+        if written != expected:
+            raise RuntimeError(
+                f'Capacity reconciliation failed: expected {expected} rows, '
+                f'found {written} in Hive for run_id={pipeline_run_id}'
+            )
 
+    # --- Subscriber state --------------------------------------------------
     if _prior_state_df is not None and not _prior_state_df.empty:
         query_client.insert_rows(
             'credit_engine.pipeline_subscriber_state',
-            ['subscriber_msisdn', 'operating_state', 'state_change_dt', 'run_date'],
+            ['subscriber_msisdn', 'operating_state', 'state_change_dt',
+             'pipeline_run_id', 'run_date'],
             [
                 (row.subscriber_msisdn, row.operating_state,
-                 pd.Timestamp(row.state_change_dt), run_date)
+                 pd.Timestamp(row.state_change_dt), pipeline_run_id, run_date)
                 for row in _prior_state_df.itertuples(index=False)
             ],
         )
 
+    # --- Run metadata ------------------------------------------------------
     cert_passed = bool(_last_certification_report.get('certified', False)) \
         if _last_certification_report else False
     cert_summary = json.dumps({
         k: v for k, v in _last_certification_report.items() if k != 'details'
     }) if _last_certification_report else '{}'
-
     query_client.insert_rows(
         'credit_engine.pipeline_run_metadata',
-        ['circuit_breaker_multiplier', 'operating_mode',
-         'certification_passed', 'certification_summary', 'run_date'],
+        ['circuit_breaker_multiplier', 'operating_mode', 'certification_passed',
+         'certification_summary', 'pipeline_run_id', 'run_date'],
         [(_circuit_breaker_multiplier, _current_operating_mode,
-          cert_passed, cert_summary, run_date)],
+          cert_passed, cert_summary, pipeline_run_id, run_date)],
     )
-    print(f'[{_now()}] Cross-cycle state persisted for {run_date}.')
+
+    # --- Commit marker (written LAST) -------------------------------------
+    query_client.insert_rows(
+        'credit_engine.pipeline_commit_log',
+        ['pipeline_run_id', 'write_status', 'committed_at', 'run_date'],
+        [(pipeline_run_id, 'COMMITTED',
+          datetime.now(timezone.utc).isoformat(), run_date)],
+    )
+    print(f'[{_now()}] Cross-cycle state committed: run_id={pipeline_run_id}, date={run_date}.')
 
 
 def load_cross_cycle_state(query_client):
-    """Restore cross-cycle state from Hive using the most recent available run_date.
+    """Restore cross-cycle state from the most recently COMMITTED run in Hive.
     Call once at process startup before the first run_batch_pipeline invocation."""
     global _previous_capacity_df, _prior_state_df, _circuit_breaker_multiplier, \
            _current_operating_mode
 
+    # Resolve target run_date from the commit log — never from data tables directly
+    commit_df = query_client.query(
+        "SELECT MAX(run_date) AS last_committed_date "
+        "FROM credit_engine.pipeline_commit_log "
+        "WHERE write_status = 'COMMITTED'"
+    ).to_dataframe()
+
+    if commit_df.empty or commit_df.iloc[0]['last_committed_date'] is None:
+        print(f'[{_now()}] No committed state found in Hive; starting with defaults.')
+        return
+
+    last_date = str(commit_df.iloc[0]['last_committed_date'])
+
     cap_df = query_client.query(
-        'SELECT subscriber_msisdn, credit_limit '
-        'FROM credit_engine.pipeline_capacity_state '
-        'WHERE run_date = (SELECT MAX(run_date) FROM credit_engine.pipeline_capacity_state)'
+        f"SELECT subscriber_msisdn, credit_limit "
+        f"FROM credit_engine.pipeline_capacity_state "
+        f"WHERE run_date = '{last_date}'"
     ).to_dataframe()
 
     state_df = query_client.query(
-        'SELECT subscriber_msisdn, operating_state, state_change_dt '
-        'FROM credit_engine.pipeline_subscriber_state '
-        'WHERE run_date = (SELECT MAX(run_date) FROM credit_engine.pipeline_subscriber_state)'
+        f"SELECT subscriber_msisdn, operating_state, state_change_dt "
+        f"FROM credit_engine.pipeline_subscriber_state "
+        f"WHERE run_date = '{last_date}'"
     ).to_dataframe()
 
     meta_df = query_client.query(
-        'SELECT circuit_breaker_multiplier, operating_mode '
-        'FROM credit_engine.pipeline_run_metadata '
-        'WHERE run_date = (SELECT MAX(run_date) FROM credit_engine.pipeline_run_metadata)'
+        f"SELECT circuit_breaker_multiplier, operating_mode "
+        f"FROM credit_engine.pipeline_run_metadata "
+        f"WHERE run_date = '{last_date}'"
     ).to_dataframe()
 
     if not cap_df.empty:
@@ -332,12 +408,13 @@ def load_cross_cycle_state(query_client):
     if not state_df.empty:
         _prior_state_df = state_df.copy()
         _prior_state_df['state_change_dt'] = pd.to_datetime(_prior_state_df['state_change_dt'])
+        _validate_state_df(_prior_state_df, context='load')
 
     if not meta_df.empty:
         _circuit_breaker_multiplier = float(meta_df.iloc[0]['circuit_breaker_multiplier'])
         _current_operating_mode     = str(meta_df.iloc[0]['operating_mode'])
 
-    print(f'[{_now()}] Cross-cycle state loaded from Hive.')
+    print(f'[{_now()}] Cross-cycle state loaded from Hive (run_date={last_date}).')
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +514,7 @@ def run_batch_pipeline(
     assert_certified(_last_certification_report, halt_on_failure=True)
 
     # Step 8: Persist cross-cycle state
-    persist_cross_cycle_state(execution_date, query_client)
+    persist_cross_cycle_state(execution_date, f'batch_{execution_date}', query_client)
 
     elapsed = round((time.perf_counter() - t_start) / 60, 1)
     print(f'\n[{_now()}] Batch pipeline complete in {elapsed} min.')

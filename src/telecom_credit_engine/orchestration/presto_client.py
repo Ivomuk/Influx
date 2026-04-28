@@ -48,7 +48,7 @@ class PrestoQueryClient:
         cursor.execute(sql_text)
         return cursor
 
-    def insert_rows(self, table, columns, rows, chunk_size=500):
+    def insert_rows(self, table, columns, rows, chunk_size=500, max_retries=3):
         """
         Inserts rows into a Hive table via chunked INSERT INTO … VALUES.
 
@@ -56,10 +56,12 @@ class PrestoQueryClient:
         columns    : list of column names in insertion order
         rows       : iterable of tuples matching column order
         chunk_size : rows per INSERT statement (default 500)
+        max_retries: attempts per chunk before raising (default 3, backoff 1s/2s/4s)
 
         Values are escaped but NOT parameterised — suitable for trusted
         internal data only (no user-supplied strings reach this path).
         """
+        import time
         col_list = ', '.join(columns)
         rows = list(rows)
         for i in range(0, len(rows), chunk_size):
@@ -69,8 +71,18 @@ class PrestoQueryClient:
                 for row in chunk
             )
             sql = f'INSERT INTO {table} ({col_list}) VALUES {value_clauses}'
-            cursor = self._conn.cursor()
-            cursor.execute(sql)
+            for attempt in range(max_retries):
+                try:
+                    cursor = self._conn.cursor()
+                    cursor.execute(sql)
+                    break
+                except Exception as exc:
+                    if attempt == max_retries - 1:
+                        raise RuntimeError(
+                            f'insert_rows: chunk {i // chunk_size + 1} failed after '
+                            f'{max_retries} attempts on {table}: {exc}'
+                        ) from exc
+                    time.sleep(2 ** attempt)
 
 
 def _sql_literal(v):
