@@ -314,6 +314,7 @@ def persist_cross_cycle_state(run_date, pipeline_run_id, query_client):
             'credit_engine.pipeline_capacity_state',
             ['subscriber_msisdn', 'credit_limit', 'pipeline_run_id', 'run_date'],
             cap_rows,
+            overwrite=True,
         )
         # Row-count reconciliation: read back and verify
         reconcile = query_client.query(
@@ -339,6 +340,7 @@ def persist_cross_cycle_state(run_date, pipeline_run_id, query_client):
                  pd.Timestamp(row.state_change_dt), pipeline_run_id, run_date)
                 for row in _prior_state_df.itertuples(index=False)
             ],
+            overwrite=True,
         )
 
     # --- Run metadata ------------------------------------------------------
@@ -353,6 +355,7 @@ def persist_cross_cycle_state(run_date, pipeline_run_id, query_client):
          'certification_summary', 'pipeline_run_id', 'run_date'],
         [(_circuit_breaker_multiplier, _current_operating_mode,
           cert_passed, cert_summary, pipeline_run_id, run_date)],
+        overwrite=True,
     )
 
     # --- Commit marker (written LAST) -------------------------------------

@@ -48,7 +48,7 @@ class PrestoQueryClient:
         cursor.execute(sql_text)
         return cursor
 
-    def insert_rows(self, table, columns, rows, chunk_size=500, max_retries=3):
+    def insert_rows(self, table, columns, rows, chunk_size=500, max_retries=3, overwrite=False):
         """
         Inserts rows into a Hive table via chunked INSERT INTO … VALUES.
 
@@ -57,6 +57,11 @@ class PrestoQueryClient:
         rows       : iterable of tuples matching column order
         chunk_size : rows per INSERT statement (default 500)
         max_retries: attempts per chunk before raising (default 3, backoff 1s/2s/4s)
+        overwrite  : if True, the first chunk uses INSERT OVERWRITE semantics via the
+                     hive.insert_existing_partitions_behavior session property, atomically
+                     replacing any orphan rows from prior failed runs. Subsequent chunks
+                     always use APPEND. The session is reset to APPEND in a finally block
+                     so it is always restored even if the INSERT fails.
 
         Values are escaped but NOT parameterised — suitable for trusted
         internal data only (no user-supplied strings reach this path).
@@ -64,25 +69,38 @@ class PrestoQueryClient:
         import time
         col_list = ', '.join(columns)
         rows = list(rows)
-        for i in range(0, len(rows), chunk_size):
+        for chunk_idx, i in enumerate(range(0, len(rows), chunk_size)):
             chunk = rows[i:i + chunk_size]
             value_clauses = ', '.join(
                 '(' + ', '.join(_sql_literal(v) for v in row) + ')'
                 for row in chunk
             )
             sql = f'INSERT INTO {table} ({col_list}) VALUES {value_clauses}'
+            use_overwrite = overwrite and chunk_idx == 0
             for attempt in range(max_retries):
                 try:
+                    if use_overwrite:
+                        self._conn.cursor().execute(
+                            "SET SESSION hive.insert_existing_partitions_behavior = 'OVERWRITE'"
+                        )
                     cursor = self._conn.cursor()
                     cursor.execute(sql)
                     break
                 except Exception as exc:
                     if attempt == max_retries - 1:
                         raise RuntimeError(
-                            f'insert_rows: chunk {i // chunk_size + 1} failed after '
+                            f'insert_rows: chunk {chunk_idx + 1} failed after '
                             f'{max_retries} attempts on {table}: {exc}'
                         ) from exc
                     time.sleep(2 ** attempt)
+                finally:
+                    if use_overwrite:
+                        try:
+                            self._conn.cursor().execute(
+                                "SET SESSION hive.insert_existing_partitions_behavior = 'APPEND'"
+                            )
+                        except Exception:
+                            pass  # best effort; APPEND is the Presto default
 
 
 def _sql_literal(v):

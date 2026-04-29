@@ -133,6 +133,44 @@ def test_insert_rows_succeeds_on_second_attempt():
     assert conn.cursor.return_value.execute.call_count == 2
 
 
+def test_insert_rows_overwrite_sets_session_before_insert():
+    """With overwrite=True, SET SESSION OVERWRITE is the first execute call."""
+    client, conn = _make_client()
+    client.insert_rows('t', ['col'], [('val',)], overwrite=True)
+    all_sqls = [c[0][0] for c in conn.cursor.return_value.execute.call_args_list]
+    assert any("OVERWRITE" in s for s in all_sqls), "SET SESSION OVERWRITE not found"
+    overwrite_idx = next(i for i, s in enumerate(all_sqls) if 'OVERWRITE' in s)
+    insert_idx = next(i for i, s in enumerate(all_sqls) if s.startswith('INSERT'))
+    assert overwrite_idx < insert_idx, "SET SESSION OVERWRITE must precede INSERT"
+
+
+def test_insert_rows_overwrite_resets_session_after_first_chunk():
+    """After the first chunk, SET SESSION APPEND is called; second chunk gets no OVERWRITE."""
+    client, conn = _make_client()
+    rows = [('a',), ('b',), ('c',)]
+    client.insert_rows('t', ['col'], rows, chunk_size=2, overwrite=True)
+    all_sqls = [c[0][0] for c in conn.cursor.return_value.execute.call_args_list]
+    overwrite_calls = [s for s in all_sqls if 'OVERWRITE' in s]
+    append_calls = [s for s in all_sqls if 'APPEND' in s]
+    insert_calls = [s for s in all_sqls if s.startswith('INSERT')]
+    assert len(overwrite_calls) == 1, "SET SESSION OVERWRITE should appear exactly once"
+    assert len(append_calls) >= 1,    "SET SESSION APPEND should appear at least once"
+    assert len(insert_calls) == 2,    "Two chunks → two INSERT statements"
+    # OVERWRITE must precede the first INSERT; APPEND must follow the first INSERT
+    ow_idx = all_sqls.index(overwrite_calls[0])
+    first_insert_idx = next(i for i, s in enumerate(all_sqls) if s.startswith('INSERT'))
+    ap_idx = next(i for i, s in enumerate(all_sqls) if 'APPEND' in s)
+    assert ow_idx < first_insert_idx < ap_idx
+
+
+def test_insert_rows_overwrite_false_no_set_session_calls():
+    """With overwrite=False (default), no SET SESSION statements are issued."""
+    client, conn = _make_client()
+    client.insert_rows('t', ['col'], [('val',)])
+    all_sqls = [c[0][0] for c in conn.cursor.return_value.execute.call_args_list]
+    assert not any('SET SESSION' in s for s in all_sqls)
+
+
 # ---------------------------------------------------------------------------
 # query / to_dataframe
 # ---------------------------------------------------------------------------
@@ -294,6 +332,28 @@ def test_persist_metadata_row_contains_cb_multiplier_and_mode():
     assert row[0] == 0.80                # circuit_breaker_multiplier
     assert row[1] == 'CONSERVATIVE'     # operating_mode
     assert row[2] is True               # certification_passed
+
+
+def test_persist_data_tables_use_overwrite_true():
+    """The three data tables must be written with overwrite=True; commit log must not."""
+    import telecom_credit_engine.orchestration.orchestrator as orch
+    qc = _make_mock_persist_client()
+    with patch.multiple(orch, **_patch_globals()):
+        orch.persist_cross_cycle_state('2026-04-01', 'batch_2026-04-01', qc)
+
+    data_tables = {
+        'credit_engine.pipeline_capacity_state',
+        'credit_engine.pipeline_subscriber_state',
+        'credit_engine.pipeline_run_metadata',
+    }
+    for c in qc.insert_rows.call_args_list:
+        table = c[0][0]
+        overwrite_flag = c[1].get('overwrite', False)
+        if table in data_tables:
+            assert overwrite_flag is True, f'{table} must be written with overwrite=True'
+        elif table == 'credit_engine.pipeline_commit_log':
+            assert overwrite_flag is False or 'overwrite' not in c[1], \
+                'commit log must use default overwrite=False'
 
 
 def test_persist_skips_capacity_write_when_none():
