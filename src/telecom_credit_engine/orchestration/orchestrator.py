@@ -331,17 +331,29 @@ def persist_cross_cycle_state(run_date, pipeline_run_id, query_client):
 
     # --- Subscriber state --------------------------------------------------
     if _prior_state_df is not None and not _prior_state_df.empty:
+        state_rows = [
+            (row.subscriber_msisdn, row.operating_state,
+             pd.Timestamp(row.state_change_dt), pipeline_run_id, run_date)
+            for row in _prior_state_df.itertuples(index=False)
+        ]
         query_client.insert_rows(
             'credit_engine.pipeline_subscriber_state',
             ['subscriber_msisdn', 'operating_state', 'state_change_dt',
              'pipeline_run_id', 'run_date'],
-            [
-                (row.subscriber_msisdn, row.operating_state,
-                 pd.Timestamp(row.state_change_dt), pipeline_run_id, run_date)
-                for row in _prior_state_df.itertuples(index=False)
-            ],
+            state_rows,
             overwrite=True,
         )
+        reconcile = query_client.query(
+            f"SELECT COUNT(*) AS cnt FROM credit_engine.pipeline_subscriber_state "
+            f"WHERE run_date = '{run_date}' AND pipeline_run_id = '{pipeline_run_id}'"
+        ).to_dataframe()
+        written = int(reconcile.iloc[0]['cnt'])
+        expected = len(state_rows)
+        if written != expected:
+            raise RuntimeError(
+                f'Subscriber state reconciliation failed: expected {expected} rows, '
+                f'found {written} in Hive for run_id={pipeline_run_id}'
+            )
 
     # --- Run metadata ------------------------------------------------------
     cert_passed = bool(_last_certification_report.get('certified', False)) \
@@ -357,6 +369,15 @@ def persist_cross_cycle_state(run_date, pipeline_run_id, query_client):
           cert_passed, cert_summary, pipeline_run_id, run_date)],
         overwrite=True,
     )
+    reconcile = query_client.query(
+        f"SELECT COUNT(*) AS cnt FROM credit_engine.pipeline_run_metadata "
+        f"WHERE run_date = '{run_date}' AND pipeline_run_id = '{pipeline_run_id}'"
+    ).to_dataframe()
+    if int(reconcile.iloc[0]['cnt']) != 1:
+        raise RuntimeError(
+            f'Run metadata reconciliation failed: expected 1 row, '
+            f'found {int(reconcile.iloc[0]["cnt"])} in Hive for run_id={pipeline_run_id}'
+        )
 
     # --- Commit marker (written LAST) -------------------------------------
     query_client.insert_rows(

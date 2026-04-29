@@ -171,6 +171,28 @@ def test_insert_rows_overwrite_false_no_set_session_calls():
     assert not any('SET SESSION' in s for s in all_sqls)
 
 
+def test_insert_rows_overwrite_warns_on_reset_failure():
+    """If the SET SESSION APPEND reset fails, a RuntimeWarning is emitted."""
+    import warnings as _warnings
+    client, conn = _make_client()
+    execute_calls = []
+
+    def _side_effect(sql):
+        execute_calls.append(sql)
+        if 'APPEND' in sql:
+            raise Exception('Presto session reset error')
+
+    conn.cursor.return_value.execute.side_effect = _side_effect
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter('always')
+        client.insert_rows('t', ['col'], [('val',)], overwrite=True)
+
+    runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert len(runtime_warnings) == 1
+    assert 'OVERWRITE mode' in str(runtime_warnings[0].message)
+
+
 # ---------------------------------------------------------------------------
 # query / to_dataframe
 # ---------------------------------------------------------------------------
@@ -215,26 +237,36 @@ def test_to_dataframe_none_description_returns_empty_df():
 # persist_cross_cycle_state — shared helpers
 # ---------------------------------------------------------------------------
 
-def _make_mock_persist_client(already_committed=False, written_count=None):
+def _make_mock_persist_client(already_committed=False, reconcile_overrides=None):
     """
     Return a mock query_client suitable for persist tests.
 
-    already_committed : if True, the idempotency check (COUNT(*)) returns 1,
-                        so persist should skip the entire write.
-    written_count     : overrides the row-count reconciliation result; leave
-                        None to auto-match the expected count (1 row).
+    already_committed    : if True, the idempotency COUNT(*) on commit_log returns 1
+                           so persist skips the entire write.
+    reconcile_overrides  : dict mapping a table-name substring to the COUNT(*) value
+                           to return for that table's reconciliation query.
+                           e.g. {'pipeline_subscriber_state': 0} returns 0 for the
+                           subscriber-state reconciliation and 1 for all others.
+                           Omit to have all reconciliation queries return the
+                           matching expected count (tests pass cleanly).
     """
+    overrides = reconcile_overrides or {}
     qc = MagicMock()
     qc.insert_rows = MagicMock()
 
     def _query(sql):
         result = MagicMock()
         if 'COUNT(*)' in sql or 'count(*)' in sql.lower():
-            # Both idempotency check and reconciliation use COUNT(*) AS cnt
-            count = (1 if already_committed else 0) if written_count is None else written_count
-            # For reconciliation (after insert), always match expected unless overridden
-            if 'pipeline_commit_log' not in sql and written_count is None:
+            if 'pipeline_commit_log' in sql:
+                # Idempotency check
+                count = 1 if already_committed else 0
+            else:
+                # Reconciliation queries — check for per-table override
                 count = 1
+                for table_fragment, override_count in overrides.items():
+                    if table_fragment in sql:
+                        count = override_count
+                        break
             result.to_dataframe.return_value = pd.DataFrame([{'cnt': count}])
         else:
             result.to_dataframe.return_value = pd.DataFrame()
@@ -417,9 +449,38 @@ def test_persist_accepts_all_valid_operating_states():
         'operating_state': valid_states,
         'state_change_dt': [pd.Timestamp('2026-04-01')] * len(valid_states),
     })
-    qc = _make_mock_persist_client(written_count=1)
+    # subscriber_state reconciliation expects 6 rows (one per valid state)
+    qc = _make_mock_persist_client(
+        reconcile_overrides={'pipeline_subscriber_state': len(valid_states)}
+    )
     with patch.multiple(orch, **_patch_globals(_prior_state_df=state_df)):
         orch.persist_cross_cycle_state('2026-04-01', 'batch_2026-04-01', qc)
+
+
+# ---------------------------------------------------------------------------
+# persist_cross_cycle_state — reconciliation failures
+# ---------------------------------------------------------------------------
+
+def test_persist_raises_on_subscriber_state_reconciliation_mismatch():
+    """RuntimeError raised when Hive COUNT(*) for subscriber_state doesn't match expected."""
+    import telecom_credit_engine.orchestration.orchestrator as orch
+    qc = _make_mock_persist_client(
+        reconcile_overrides={'pipeline_subscriber_state': 0}
+    )
+    with patch.multiple(orch, **_patch_globals()):
+        with pytest.raises(RuntimeError, match='Subscriber state reconciliation failed'):
+            orch.persist_cross_cycle_state('2026-04-01', 'batch_2026-04-01', qc)
+
+
+def test_persist_raises_on_run_metadata_reconciliation_mismatch():
+    """RuntimeError raised when Hive COUNT(*) for run_metadata doesn't equal 1."""
+    import telecom_credit_engine.orchestration.orchestrator as orch
+    qc = _make_mock_persist_client(
+        reconcile_overrides={'pipeline_run_metadata': 0}
+    )
+    with patch.multiple(orch, **_patch_globals()):
+        with pytest.raises(RuntimeError, match='Run metadata reconciliation failed'):
+            orch.persist_cross_cycle_state('2026-04-01', 'batch_2026-04-01', qc)
 
 
 # ---------------------------------------------------------------------------

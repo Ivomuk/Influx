@@ -1,3 +1,5 @@
+import warnings
+
 import pandas as pd
 
 
@@ -99,8 +101,15 @@ class PrestoQueryClient:
                             self._conn.cursor().execute(
                                 "SET SESSION hive.insert_existing_partitions_behavior = 'APPEND'"
                             )
-                        except Exception:
-                            pass  # best effort; APPEND is the Presto default
+                        except Exception as reset_exc:
+                            warnings.warn(
+                                f"insert_rows: failed to reset "
+                                f"hive.insert_existing_partitions_behavior to APPEND "
+                                f"on table {table}: {reset_exc}. "
+                                f"Session may remain in OVERWRITE mode.",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
 
 
 def _sql_literal(v):
