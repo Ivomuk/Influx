@@ -66,32 +66,36 @@ _last_certification_report = None   # most recent certification result
 # In production these are Presto/Athena queries submitted via the job scheduler.
 # ---------------------------------------------------------------------------
 
-def run_sql_batch_pipeline(execution_date):
+def run_sql_batch_pipeline(execution_date, batch_engine):
     """
-    Executes vw1 -> vw2 -> vw3 -> vw4 -> vw5 -> vw6 in order.
-    Returns (layer1_df, layer0_df, vw5_df, vw6_df) as pandas DataFrames
-    loaded from the query results.
-    execution_date: date string 'YYYY-MM-DD' for partition filtering.
-    """
-    print(f'[{_now()}] SQL batch pipeline starting for {execution_date}')
+    Materialises vw1–vw6 via Presto then returns four DataFrames consumed by
+    the decision engine. vw1/vw2 are refreshed as lazy views; vw3–vw6 are
+    materialised into partitioned Hive tables (CTAS on first run, INSERT
+    OVERWRITE on subsequent runs).
 
-    # Wire up query_engine (BigQuery client or equivalent) before calling this.
-    # Each view must complete before the next starts (strict dependency order).
-    raise NotImplementedError(
-        'run_sql_batch_pipeline: provide a query_engine implementation. '
-        'Expected pattern:\n'
-        '  query_engine.run("vw1_credit_v1_normalized_events", date=execution_date)\n'
-        '  query_engine.run("vw2_credit_v1_subscriber_day",    date=execution_date)\n'
-        '  query_engine.run("vw3_credit_v1_layer1_features",   date=execution_date)\n'
-        '  query_engine.run("vw4_credit_v1_layer0_scores",     date=execution_date)\n'
-        '  query_engine.run("vw5_credit_v1_reason_codes",      date=execution_date)\n'
-        '  query_engine.run("vw6_credit_v1_cap_and_action",    date=execution_date)\n'
-        '  layer1_df = query_engine.read("vw3_credit_v1_layer1_features")\n'
-        '  layer0_df = query_engine.read("vw4_credit_v1_layer0_scores")\n'
-        '  vw5_df    = query_engine.read("vw5_credit_v1_reason_codes")\n'
-        '  vw6_df    = query_engine.read("vw6_credit_v1_cap_and_action")\n'
-        '  return layer1_df, layer0_df, vw5_df, vw6_df'
-    )
+    execution_date : 'YYYY-MM-DD' partition key
+    batch_engine   : PrestoSQLBatchEngine instance
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+    _log.info('[%s] SQL batch pipeline starting for %s', _now(), execution_date)
+
+    for view in [
+        'vw1_credit_v1_normalized_events',
+        'vw2_credit_v1_subscriber_day',
+        'vw3_credit_v1_layer1_features',
+        'vw4_credit_v1_layer0_scores',
+        'vw5_credit_v1_reason_codes',
+        'vw6_credit_v1_cap_and_action',
+    ]:
+        batch_engine.run(view, execution_date)
+
+    layer1_df = batch_engine.read('vw3_credit_v1_layer1_features', execution_date)
+    layer0_df = batch_engine.read('vw4_credit_v1_layer0_scores',   execution_date)
+    vw5_df    = batch_engine.read('vw5_credit_v1_reason_codes',    execution_date)
+    vw6_df    = batch_engine.read('vw6_credit_v1_cap_and_action',  execution_date)
+
+    return layer1_df, layer0_df, vw5_df, vw6_df
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +490,9 @@ def run_batch_pipeline(
     print(f'{"="*60}')
 
     # Step 1: SQL views
-    layer1_df, layer0_df, vw5_df, vw6_df = run_sql_batch_pipeline(execution_date)
+    from telecom_credit_engine.orchestration.batch_engine import PrestoSQLBatchEngine
+    batch_engine = PrestoSQLBatchEngine(query_client)
+    layer1_df, layer0_df, vw5_df, vw6_df = run_sql_batch_pipeline(execution_date, batch_engine)
 
     # Step 2: Data contracts + QA gates
     run_sql_qa_gates(layer1_df, layer0_df, vw5_df, vw6_df)
