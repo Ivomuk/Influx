@@ -193,6 +193,48 @@ def test_insert_rows_overwrite_warns_on_reset_failure():
     assert 'OVERWRITE mode' in str(runtime_warnings[0].message)
 
 
+def test_insert_rows_overwrite_retry_succeeds_after_insert_and_reset_both_fail():
+    """
+    Verifies correct retry behaviour when, on attempt 0:
+      - SET SESSION OVERWRITE succeeds
+      - INSERT fails
+      - SET SESSION APPEND (reset) also fails → RuntimeWarning emitted
+    On attempt 1 the INSERT succeeds and the reset succeeds.
+    The row must be written exactly once and the session must end in APPEND.
+    """
+    import warnings as _warnings
+    client, conn = _make_client()
+
+    call_log = []
+
+    def _side_effect(sql):
+        call_log.append(sql)
+        if 'OVERWRITE' in sql:
+            return  # SET SESSION OVERWRITE always succeeds
+        if sql.startswith('INSERT') and call_log.count(sql) == 1:
+            raise Exception('transient Presto error')   # first INSERT attempt fails
+        if 'APPEND' in sql and sum(1 for s in call_log if 'APPEND' in s) == 1:
+            raise Exception('transient reset error')    # first APPEND attempt also fails
+
+    conn.cursor.return_value.execute.side_effect = _side_effect
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter('always')
+        client.insert_rows('t', ['col'], [('val',)], overwrite=True, max_retries=3)
+
+    # The insert must have ultimately succeeded (no RuntimeError raised)
+    inserts = [s for s in call_log if s.startswith('INSERT')]
+    assert len(inserts) == 2, "Expected two INSERT attempts (fail then succeed)"
+
+    # The RuntimeWarning for the failed reset must have been emitted
+    runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert len(runtime_warnings) == 1, "Expected one RuntimeWarning for failed APPEND reset"
+
+    # The final APPEND reset (attempt 1) must have succeeded
+    appends = [s for s in call_log if 'APPEND' in s]
+    assert len(appends) == 2, "Expected two APPEND resets (fail then succeed)"
+
+
 # ---------------------------------------------------------------------------
 # query / to_dataframe
 # ---------------------------------------------------------------------------

@@ -1,6 +1,9 @@
+import logging
 import warnings
 
 import pandas as pd
+
+_log = logging.getLogger(__name__)
 
 
 def make_query_client(host, port, user, password,
@@ -102,14 +105,14 @@ class PrestoQueryClient:
                                 "SET SESSION hive.insert_existing_partitions_behavior = 'APPEND'"
                             )
                         except Exception as reset_exc:
-                            warnings.warn(
+                            msg = (
                                 f"insert_rows: failed to reset "
                                 f"hive.insert_existing_partitions_behavior to APPEND "
                                 f"on table {table}: {reset_exc}. "
-                                f"Session may remain in OVERWRITE mode.",
-                                RuntimeWarning,
-                                stacklevel=2,
+                                f"Session may remain in OVERWRITE mode."
                             )
+                            _log.error(msg)
+                            warnings.warn(msg, RuntimeWarning, stacklevel=2)
 
 
 def _sql_literal(v):

@@ -343,6 +343,7 @@ def persist_cross_cycle_state(run_date, pipeline_run_id, query_client):
             state_rows,
             overwrite=True,
         )
+        # Extra round-trip intentional: correctness > latency for lending-capacity state
         reconcile = query_client.query(
             f"SELECT COUNT(*) AS cnt FROM credit_engine.pipeline_subscriber_state "
             f"WHERE run_date = '{run_date}' AND pipeline_run_id = '{pipeline_run_id}'"
@@ -369,6 +370,7 @@ def persist_cross_cycle_state(run_date, pipeline_run_id, query_client):
           cert_passed, cert_summary, pipeline_run_id, run_date)],
         overwrite=True,
     )
+    # Extra round-trip intentional: correctness > latency for lending-capacity state
     reconcile = query_client.query(
         f"SELECT COUNT(*) AS cnt FROM credit_engine.pipeline_run_metadata "
         f"WHERE run_date = '{run_date}' AND pipeline_run_id = '{pipeline_run_id}'"
