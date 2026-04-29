@@ -3,8 +3,12 @@
 # Call after check_eligibility_batch() and run_layers_5_to_8() respectively.
 # Returns a dict of {check_name: fail_df or fail_list}; all empty = full pass.
 
+import logging
+
 import pandas as pd
 import numpy as np
+
+_log = logging.getLogger(__name__)
 
 VALID_DECISION_STATUSES_API = {'approved_or_maintained', 'blocked_or_restricted', 'declined', 'NO_DATA', 'ENGINE_ERROR'}
 VALID_OPERATING_STATES = {'Healthy', 'At Risk', 'Distressed', 'Cooling Off', 'Recovered', 'Restricted', 'Fraud Review'}
@@ -28,7 +32,7 @@ def qa_eligibility_response(eligibility_df, latency_sla_ms=LATENCY_SLA_MS):
     missing = required_cols - set(df.columns)
     if missing:
         results['QA-API-00_missing_columns'] = list(missing)
-        print(f'QA FAIL [QA-API-00]: missing columns {missing}')
+        _log.warning('QA FAIL [QA-API-00]: missing columns %s', missing)
         return results
 
     # QA-API-01: Negative CreditLimit
@@ -90,7 +94,7 @@ def qa_state_transitions(state_df, prior_state_df=None):
     missing = required_cols - set(df.columns)
     if missing:
         results['QA-ST-00_missing_columns'] = list(missing)
-        print(f'QA FAIL [QA-ST-00]: missing columns {missing}')
+        _log.warning('QA FAIL [QA-ST-00]: missing columns %s', missing)
         return results
 
     # QA-ST-01: operating_state contains unexpected values
@@ -136,9 +140,9 @@ def qa_state_transitions(state_df, prior_state_df=None):
 
 def _print_result(label, result):
     if isinstance(result, pd.DataFrame) and not result.empty:
-        print(f'QA FAIL [{label}]: {len(result)} rows')
+        _log.warning('QA FAIL [%s]: %d rows', label, len(result))
     elif isinstance(result, list) and result:
-        print(f'QA FAIL [{label}]: {result}')
+        _log.warning('QA FAIL [%s]: %s', label, result)
 
 
 def run_qa_api_and_states(eligibility_df, state_df, prior_state_df=None):
@@ -155,7 +159,7 @@ def run_qa_api_and_states(eligibility_df, state_df, prior_state_df=None):
         or (isinstance(v, list) and v)
     }
     passed = len(results) - len(failed)
-    print(f'\nAPI + State QA: {passed}/{len(results)} checks passed.')
+    _log.info('API + State QA: %d/%d checks passed.', passed, len(results))
     if failed:
-        print(f'FAILED checks: {list(failed.keys())}')
+        _log.warning('FAILED checks: %s', list(failed.keys()))
     return results

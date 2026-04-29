@@ -27,9 +27,12 @@
 #   circuit_breaker_multiplier -> next run applied to policy_capacity_cap
 
 import json
+import logging
 import pandas as pd
 import time
 from datetime import datetime, timezone
+
+_log = logging.getLogger(__name__)
 
 from telecom_credit_engine.decisioning.run_credit_v1_decision_engine import run_credit_v1_decision_engine, DECISION_ENGINE_CONFIG, ACTION_SPECS_DF
 from telecom_credit_engine.state_management.run_layers_5_to_8 import run_layers_5_to_8, STATE_ENGINE_CONFIG, INTERVENTION_CONFIG, PORTFOLIO_CONFIG, GOVERNANCE_CONFIG
@@ -76,9 +79,7 @@ def run_sql_batch_pipeline(execution_date, batch_engine):
     execution_date : 'YYYY-MM-DD' partition key
     batch_engine   : PrestoSQLBatchEngine instance
     """
-    import logging
-    _log = logging.getLogger(__name__)
-    _log.info('[%s] SQL batch pipeline starting for %s', _now(), execution_date)
+    _log.info('SQL batch pipeline starting for %s', execution_date)
 
     for view in [
         'vw1_credit_v1_normalized_events',
@@ -109,10 +110,10 @@ def run_sql_qa_gates(layer1_df, layer0_df, vw5_df=None, vw6_df=None):
     """
     from telecom_credit_engine.contracts.data_contracts import validate_all_pipeline_inputs, ContractViolationError
 
-    print(f'[{_now()}] Running data contract validation.')
+    _log.info('Running data contract validation.')
     validate_all_pipeline_inputs(layer1_df, layer0_df, vw5_df, vw6_df, strict=True)
 
-    print(f'[{_now()}] Running SQL QA gates.')
+    _log.info('Running SQL QA gates.')
 
     dupes_l1 = layer1_df.groupby(['feature_dt', 'subscriber_msisdn']).size().reset_index(name='count')
     if (dupes_l1['count'] > 1).any():
@@ -126,7 +127,7 @@ def run_sql_qa_gates(layer1_df, layer0_df, vw5_df=None, vw6_df=None):
         if layer0_df['debt_stress_index_v1'].lt(0).any() or layer0_df['debt_stress_index_v1'].gt(100).any():
             raise RuntimeError('QA GATE FAIL: debt_stress_index_v1 outside [0, 100]')
 
-    print(f'[{_now()}] Data contracts + SQL QA gates passed.')
+    _log.info('Data contracts + SQL QA gates passed.')
 
 
 # ---------------------------------------------------------------------------
@@ -155,8 +156,8 @@ def run_decision_engine_step(layer1_df, layer0_df, vw5_df, vw6_df,
         config_dict, _current_operating_mode, _circuit_breaker_multiplier
     )
 
-    print(f'[{_now()}] Decision engine starting. '
-          f'mode={_current_operating_mode} circuit_breaker={_circuit_breaker_multiplier}')
+    _log.info('Decision engine starting. mode=%s circuit_breaker=%s',
+              _current_operating_mode, _circuit_breaker_multiplier)
 
     engine_outputs = run_credit_v1_decision_engine(
         layer1_df, layer0_df,
@@ -178,7 +179,7 @@ def run_decision_engine_step(layer1_df, layer0_df, vw5_df, vw6_df,
     if critical_failures:
         raise RuntimeError(f'QA GATE FAIL: critical decision engine checks failed: {critical_failures}')
 
-    print(f'[{_now()}] Decision engine complete.')
+    _log.info('Decision engine complete.')
     return engine_outputs
 
 
@@ -198,7 +199,7 @@ def run_layers_5_to_8_step(engine_outputs, state_config, intervention_config,
     policy_prefilter_df = engine_outputs['vw7_credit_v1_policy_prefilter']
     final_capacity_df = engine_outputs['vw9_credit_v1_final_capacity_output']
 
-    print(f'[{_now()}] Layers 5-8 starting.')
+    _log.info('Layers 5-8 starting.')
 
     layer_outputs = run_layers_5_to_8(
         policy_prefilter_df, final_capacity_df,
@@ -215,9 +216,8 @@ def run_layers_5_to_8_step(engine_outputs, state_config, intervention_config,
     ].copy()
     _circuit_breaker_multiplier = layer_outputs['circuit_breaker_capacity_multiplier']
 
-    print(f'[{_now()}] Layers 5-8 complete. '
-          f'portfolio_signal={layer_outputs["portfolio_control_signal"]} '
-          f'cb_multiplier={_circuit_breaker_multiplier}')
+    _log.info('Layers 5-8 complete. portfolio_signal=%s cb_multiplier=%s',
+              layer_outputs['portfolio_control_signal'], _circuit_breaker_multiplier)
 
     return layer_outputs
 
@@ -228,9 +228,9 @@ def run_layers_5_to_8_step(engine_outputs, state_config, intervention_config,
 
 def run_feature_store_bootstrap(layer1_df, layer0_df):
     """Loads batch output into the cold + hot paths so the eligibility API is ready."""
-    print(f'[{_now()}] Bootstrapping feature store from batch output.')
+    _log.info('Bootstrapping feature store from batch output.')
     load_from_batch_output(layer1_df, layer0_df)
-    print(get_store_health().to_string(index=False))
+    _log.info('Feature store health:\n%s', get_store_health().to_string(index=False))
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +241,7 @@ def run_outcome_tracking_step(engine_outputs, layer0_df, layer1_df,
                                lender_feedback_df, evaluation_date,
                                outcome_config, fairness_config, explainability_config):
     """Runs the full Dimension 6 outcome tracking pipeline."""
-    print(f'[{_now()}] Outcome tracking starting for evaluation_date={evaluation_date}.')
+    _log.info('Outcome tracking starting for evaluation_date=%s', evaluation_date)
 
     final_capacity_df = engine_outputs['vw9_credit_v1_final_capacity_output']
 
@@ -252,7 +252,7 @@ def run_outcome_tracking_step(engine_outputs, layer0_df, layer1_df,
         fairness_config=fairness_config,
         explainability_config=explainability_config,
     )
-    print(f'[{_now()}] Outcome tracking complete.')
+    _log.info('Outcome tracking complete.')
     return tracking_outputs
 
 
@@ -302,7 +302,7 @@ def persist_cross_cycle_state(run_date, pipeline_run_id, query_client):
         f"AND write_status = 'COMMITTED'"
     ).to_dataframe()
     if not existing.empty and int(existing.iloc[0]['cnt']) > 0:
-        print(f'[{_now()}] State already committed for run_id={pipeline_run_id}; skipping.')
+        _log.info('State already committed for run_id=%s; skipping.', pipeline_run_id)
         return
 
     # --- Validate states before writing ------------------------------------
@@ -392,7 +392,7 @@ def persist_cross_cycle_state(run_date, pipeline_run_id, query_client):
         [(pipeline_run_id, 'COMMITTED',
           datetime.now(timezone.utc).isoformat(), run_date)],
     )
-    print(f'[{_now()}] Cross-cycle state committed: run_id={pipeline_run_id}, date={run_date}.')
+    _log.info('Cross-cycle state committed: run_id=%s, date=%s.', pipeline_run_id, run_date)
 
 
 def load_cross_cycle_state(query_client):
@@ -409,7 +409,7 @@ def load_cross_cycle_state(query_client):
     ).to_dataframe()
 
     if commit_df.empty or commit_df.iloc[0]['last_committed_date'] is None:
-        print(f'[{_now()}] No committed state found in Hive; starting with defaults.')
+        _log.info('No committed state found in Hive; starting with defaults.')
         return
 
     last_date = str(commit_df.iloc[0]['last_committed_date'])
@@ -444,7 +444,7 @@ def load_cross_cycle_state(query_client):
         _circuit_breaker_multiplier = float(meta_df.iloc[0]['circuit_breaker_multiplier'])
         _current_operating_mode     = str(meta_df.iloc[0]['operating_mode'])
 
-    print(f'[{_now()}] Cross-cycle state loaded from Hive (run_date={last_date}).')
+    _log.info('Cross-cycle state loaded from Hive (run_date=%s).', last_date)
 
 
 # ---------------------------------------------------------------------------
@@ -485,9 +485,7 @@ def run_batch_pipeline(
     global _previous_capacity_df
 
     t_start = time.perf_counter()
-    print(f'\n{"="*60}')
-    print(f'[{_now()}] Batch pipeline starting: {execution_date}')
-    print(f'{"="*60}')
+    _log.info('Batch pipeline starting: %s', execution_date)
 
     # Step 1: SQL views
     from telecom_credit_engine.orchestration.batch_engine import PrestoSQLBatchEngine
@@ -549,7 +547,7 @@ def run_batch_pipeline(
     persist_cross_cycle_state(execution_date, f'batch_{execution_date}', query_client)
 
     elapsed = round((time.perf_counter() - t_start) / 60, 1)
-    print(f'\n[{_now()}] Batch pipeline complete in {elapsed} min.')
+    _log.info('Batch pipeline complete in %s min.', elapsed)
 
     return {
         'engine_outputs':        engine_outputs,

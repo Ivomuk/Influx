@@ -4,8 +4,12 @@
 # Call run_qa_decision_engine_output(outputs, config) after run_credit_v1_decision_engine().
 # Returns a dict of {check_name: fail_df}; all fail_dfs empty = full pass.
 
+import logging
+
 import pandas as pd
 import numpy as np
+
+_log = logging.getLogger(__name__)
 
 VALID_ACTIONS = {'DECLINE', 'RESTRICT', 'REDUCE', 'MAINTAIN', 'INCREASE_SMALL', 'INCREASE_MEDIUM'}
 # Three-value status mirrors the action distinction partners need:
@@ -27,7 +31,7 @@ VALID_REASON_CODES = {
 
 def _fail(df, label):
     if not df.empty:
-        print(f'QA FAIL [{label}]: {len(df)} rows')
+        _log.warning('QA FAIL [%s]: %d rows', label, len(df))
     return df
 
 
@@ -143,7 +147,7 @@ def run_qa_decision_engine_output(engine_outputs, config_dict, previous_capacity
 
     failed = {k: v for k, v in results.items() if not v.empty}
     passed = len(results) - len(failed)
-    print(f'\nDecision Engine QA: {passed}/{len(results)} checks passed.')
+    _log.info('Decision Engine QA: %d/%d checks passed.', passed, len(results))
     if failed:
-        print(f'FAILED checks: {list(failed.keys())}')
+        _log.warning('FAILED checks: %s', list(failed.keys()))
     return results

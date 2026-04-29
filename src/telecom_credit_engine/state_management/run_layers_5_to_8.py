@@ -7,11 +7,15 @@
 #   - Portfolio circuit breaker feedback: portfolio_control_signal is returned
 #     as a capacity multiplier that callers can pass into the decision engine.
 
+import logging
+
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
 
 tqdm.pandas()
+
+_log = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------
 # Configuration defaults — mirrors configs/Config_Layer_5_to_8.py.
@@ -488,7 +492,7 @@ def run_layers_5_to_8(
     cb_signal = str(latest_monitor.get('portfolio_control_signal', 'STABLE_PORTFOLIO'))
 
     if cb_multiplier < 1.0:
-        print(f'PORTFOLIO ALERT: {cb_signal} — capacity multiplier applied: {cb_multiplier:.2f}')
+        _log.warning('PORTFOLIO ALERT: %s — capacity multiplier applied: %.2f', cb_signal, cb_multiplier)
 
     return {
         'state_df': state_df,
@@ -510,8 +514,8 @@ if __name__ == '__main__':
     portfolio_monitor_df = layer_5_to_8_outputs['portfolio_monitor_df']
     governance_log_df = layer_5_to_8_outputs['governance_log_df']
 
-    print(state_df)
-    print(intervention_df)
-    print(portfolio_monitor_df[['feature_dt', 'portfolio_control_signal', 'circuit_breaker_capacity_multiplier']])
-    print(governance_log_df[['feature_dt', 'subscriber_msisdn', 'operating_state', 'selected_action',
-                               'CreditLimit', 'persistence_block_applied', 'audit_trigger_flag']])
+    _log.debug('%s', state_df)
+    _log.debug('%s', intervention_df)
+    _log.debug('%s', portfolio_monitor_df[['feature_dt', 'portfolio_control_signal', 'circuit_breaker_capacity_multiplier']])
+    _log.debug('%s', governance_log_df[['feature_dt', 'subscriber_msisdn', 'operating_state', 'selected_action',
+                                        'CreditLimit', 'persistence_block_applied', 'audit_trigger_flag']])
