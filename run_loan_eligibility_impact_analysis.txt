@@ -1,0 +1,552 @@
+# ============================================================
+# run_loan_eligibility_impact_analysis.py
+#
+# PURPOSE: Quantify the commercial and risk impact of the six
+# proposed BankTech loan eligibility rules on revenue, customers,
+# loan value, and loan volume.
+#
+# INPUT:   eligibility_df — loaded from vw_loan_eligibility_waterfall
+# OUTPUTS: eligibility waterfall | current vs proposed comparison |
+#          standalone rule impact | sensitivity scenarios |
+#          risk segmentation | executive summary
+#
+# DATA NOTE: Source window is April 2026 (30 days).
+#   - Rules 3 & 4 require 90 days; 30-day data used as direct proxy.
+#     Apply window_scale_factor=3.0 in apply_eligibility_rules() to
+#     approximate 90-day behaviour when running with live data.
+#   - Rule 1 (MoMo age >= 180 days) requires the subscriber
+#     registration table. A placeholder (all pass) is used until
+#     that join is available. See vw_loan_eligibility_waterfall.
+# ============================================================
+
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+
+tqdm.pandas()
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+ANALYSIS_CONFIG = {
+    # BankTech revenue rate applied to credit limit (MAINTAIN action margin)
+    'base_margin_rate': 0.10,
+    # Days of data available vs. full analysis window
+    'data_window_days': 30,
+    'full_rule_window_days': 90,
+    # Used when scaling 30-day metrics to 90-day equivalent
+    'window_scale_factor': 1.0,       # set to 3.0 when using live 30-day data as proxy
+    'output_version': 'loan_eligibility_impact_v1',
+}
+
+# Six agreed eligibility rules
+ELIGIBILITY_RULES = {
+    'rule1': 'MoMo age >= 180 days',
+    'rule2': 'MAU30 (active in last 30 days)',
+    'rule3': 'Min 5 MoMo transactions in 90 days',
+    'rule4': 'Min UGX 10,000 inflow/outflow in 90 days',
+    'rule5': 'No active term loan overdue > 60 days',
+    'rule6': 'No cooling-off period active (90-day window)',
+}
+
+REQUIRED_ELIGIBILITY_COLS = [
+    'subscriber_msisdn',
+    'active_days_last30d',
+    'momo_txn_cnt_30d',
+    'momo_inflow_30d',
+    'momo_outflow_30d',
+    'outstanding_exposure_amt',
+    'repayment_ratio_30d',
+    'days_since_last_disbursement',
+    'days_since_last_repayment',
+    'loan_disb_amt_30d',
+    'loan_repaid_amt_30d',
+    'wallet_inflow_amt_30d',
+    'wallet_outflow_amt_30d',
+    'disbursement_cnt_30d',
+    'wallet_active_days_30d',
+    'expected_repayment_probability',
+    'expected_credit_loss_rate',
+    'debt_stress_index',
+    'fraud_abuse_risk_score',
+    'clv_contribution',
+    'current_credit_limit',
+    'current_recommended_action',
+    'currently_eligible_flag',
+]
+
+# Three threshold scenarios for sensitivity analysis
+SCENARIO_CONFIGS = {
+    'proposed': {
+        'label':              'Proposed (agreed rules)',
+        'rule2_required':     True,
+        'rule3_min_txns':     5,
+        'rule4_min_value':    10000,
+        'rule5_overdue_days': 60,
+        'rule6_repay_delay':  30,
+        'rule6_ratio_cap':    0.50,
+    },
+    'less_strict': {
+        'label':              'Less Strict',
+        'rule2_required':     True,
+        'rule3_min_txns':     3,
+        'rule4_min_value':    5000,
+        'rule5_overdue_days': 60,
+        'rule6_repay_delay':  45,
+        'rule6_ratio_cap':    0.30,
+    },
+    'more_strict': {
+        'label':              'More Strict',
+        'rule2_required':     True,
+        'rule3_min_txns':     10,
+        'rule4_min_value':    20000,
+        'rule5_overdue_days': 60,
+        'rule6_repay_delay':  30,
+        'rule6_ratio_cap':    0.75,
+    },
+}
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def validate_eligibility_df(df):
+    missing = [c for c in REQUIRED_ELIGIBILITY_COLS if c not in df.columns]
+    if missing:
+        raise ValueError('eligibility_df is missing columns: ' + ', '.join(missing))
+
+
+# ============================================================
+# RULE ENGINE
+# ============================================================
+
+def apply_eligibility_rules(df, scenario_cfg, window_scale_factor=1.0):
+    """
+    Apply all six eligibility rules according to scenario thresholds.
+    Returns df with per-rule flags and a proposed_eligible flag.
+    window_scale_factor: multiply 30-day transaction counts/values to
+    approximate the 90-day window required by the rules.
+    """
+    out = df.copy()
+
+    # Rule 1: MoMo age >= 180 days
+    # Placeholder — all subscribers pass until subscriber_registry join is added.
+    if 'rule1_momo_age_180d_flag' in out.columns:
+        out['rule1_flag'] = out['rule1_momo_age_180d_flag']
+    else:
+        out['rule1_flag'] = 1
+
+    # Rule 2: MAU30
+    if scenario_cfg.get('rule2_required', True):
+        out['rule2_flag'] = (out['active_days_last30d'] >= 1).astype(int)
+    else:
+        out['rule2_flag'] = 1
+
+    # Rule 3: >= N MoMo transactions in 90 days
+    scaled_txns = out['momo_txn_cnt_30d'] * window_scale_factor
+    out['rule3_flag'] = (scaled_txns >= scenario_cfg['rule3_min_txns']).astype(int)
+
+    # Rule 4: >= UGX X in inflows or outflows in 90 days
+    scaled_inflow  = out['momo_inflow_30d']  * window_scale_factor
+    scaled_outflow = out['momo_outflow_30d'] * window_scale_factor
+    out['rule4_flag'] = (
+        (scaled_inflow  >= scenario_cfg['rule4_min_value']) |
+        (scaled_outflow >= scenario_cfg['rule4_min_value'])
+    ).astype(int)
+
+    # Rule 5: No active term loan overdue > overdue_days days
+    overdue = (
+        (out['outstanding_exposure_amt'] > 0) &
+        (out['days_since_last_repayment'].fillna(0) > scenario_cfg['rule5_overdue_days']) &
+        (out['repayment_ratio_30d'].fillna(0) < 0.10)
+    )
+    out['rule5_flag'] = (~overdue).astype(int)
+
+    # Rule 6: Not in cooling-off (due_date + repay_delay → 90-day cooldown)
+    cooling = (
+        (out['outstanding_exposure_amt'] > 0) &
+        (out['days_since_last_repayment'].fillna(0) > scenario_cfg['rule6_repay_delay']) &
+        (out['repayment_ratio_30d'].fillna(0) < scenario_cfg['rule6_ratio_cap'])
+    )
+    out['rule6_flag'] = (~cooling).astype(int)
+
+    # Cumulative waterfall
+    out['eligible_after_rule1'] = out['rule1_flag']
+    out['eligible_after_rule2'] = (out['eligible_after_rule1'] & out['rule2_flag']).astype(int)
+    out['eligible_after_rule3'] = (out['eligible_after_rule2'] & out['rule3_flag']).astype(int)
+    out['eligible_after_rule4'] = (out['eligible_after_rule3'] & out['rule4_flag']).astype(int)
+    out['eligible_after_rule5'] = (out['eligible_after_rule4'] & out['rule5_flag']).astype(int)
+    out['proposed_eligible']    = (out['eligible_after_rule5'] & out['rule6_flag']).astype(int)
+
+    return out
+
+
+def add_revenue_estimate(df, config):
+    """Add estimated_monthly_revenue column using credit_limit * margin * repayment_prob."""
+    out = df.copy()
+    out['estimated_monthly_revenue'] = (
+        out['current_credit_limit']
+        * config['base_margin_rate']
+        * out['expected_repayment_probability'].fillna(0.25)
+    )
+    return out
+
+
+# ============================================================
+# ANALYSIS TABLES
+# ============================================================
+
+def build_eligibility_waterfall(df):
+    """
+    Rule-by-rule eligibility waterfall.
+    Shows customers remaining and dropped at each step.
+    """
+    total = len(df)
+    steps = [
+        ('Base',   'All MoMo subscribers',                    total,                               None),
+        ('Rule 1', ELIGIBILITY_RULES['rule1'],                 df['eligible_after_rule1'].sum(),    'eligible_after_rule1'),
+        ('Rule 2', ELIGIBILITY_RULES['rule2'],                 df['eligible_after_rule2'].sum(),    'eligible_after_rule2'),
+        ('Rule 3', ELIGIBILITY_RULES['rule3'],                 df['eligible_after_rule3'].sum(),    'eligible_after_rule3'),
+        ('Rule 4', ELIGIBILITY_RULES['rule4'],                 df['eligible_after_rule4'].sum(),    'eligible_after_rule4'),
+        ('Rule 5', ELIGIBILITY_RULES['rule5'],                 df['eligible_after_rule5'].sum(),    'eligible_after_rule5'),
+        ('Rule 6', ELIGIBILITY_RULES['rule6'],                 df['proposed_eligible'].sum(),       'proposed_eligible'),
+    ]
+
+    rows = []
+    prev = total
+    for step, desc, remaining, _ in steps:
+        remaining = int(remaining)
+        dropped   = prev - remaining if step != 'Base' else 0
+        drop_pct  = f'{dropped / prev * 100:.1f}%' if prev > 0 and step != 'Base' else '–'
+        pass_pct  = f'{remaining / total * 100:.1f}%' if total > 0 else '–'
+        rows.append({
+            'Step':                  step,
+            'Rule Applied':          desc,
+            'Customers Remaining':   f'{remaining:,}',
+            'Customers Dropped':     f'{dropped:,}' if step != 'Base' else '–',
+            'Drop %':                drop_pct,
+            'Cumulative Pass %':     pass_pct,
+        })
+        prev = remaining
+
+    return pd.DataFrame(rows)
+
+
+def build_impact_comparison(df):
+    """
+    Current vs proposed eligibility across revenue, customers,
+    loan value, volume, and risk quality.
+    """
+    cur  = df[df['currently_eligible_flag'] == 1]
+    prop = df[df['proposed_eligible'] == 1]
+
+    def fmt(v):
+        return f'{v:,.0f}'
+
+    def pct_chg(new, old):
+        if old == 0:
+            return 'N/A'
+        return f'{(new - old) / old * 100:+.1f}%'
+
+    def diff(new, old):
+        return f'{new - old:+,.0f}'
+
+    rows = [
+        ('Eligible customers',                      len(cur),                                  len(prop)),
+        ('Loan disbursements in window (count)',     int(cur['disbursement_cnt_30d'].sum()),    int(prop['disbursement_cnt_30d'].sum())),
+        ('Total loan disbursement value (UGX)',      cur['loan_disb_amt_30d'].sum(),            prop['loan_disb_amt_30d'].sum()),
+        ('Total wallet inflow (UGX)',                cur['wallet_inflow_amt_30d'].sum(),        prop['wallet_inflow_amt_30d'].sum()),
+        ('Outstanding exposure (UGX)',               cur['outstanding_exposure_amt'].sum(),     prop['outstanding_exposure_amt'].sum()),
+        ('Avg credit limit (UGX)',                   cur['current_credit_limit'].mean(),        prop['current_credit_limit'].mean()),
+        ('Est. monthly BankTech revenue (UGX)',      cur['estimated_monthly_revenue'].sum(),    prop['estimated_monthly_revenue'].sum()),
+        ('Avg repayment ratio',                      cur['repayment_ratio_30d'].mean(),         prop['repayment_ratio_30d'].mean()),
+        ('Avg debt stress index',                    cur['debt_stress_index'].mean(),           prop['debt_stress_index'].mean()),
+        ('Avg expected credit loss rate',            cur['expected_credit_loss_rate'].mean(),   prop['expected_credit_loss_rate'].mean()),
+        ('Avg fraud risk score',                     cur['fraud_abuse_risk_score'].mean(),      prop['fraud_abuse_risk_score'].mean()),
+    ]
+
+    output = []
+    for metric, c_val, p_val in rows:
+        output.append({
+            'Metric':          metric,
+            'Current Rules':   fmt(c_val),
+            'Proposed Rules':  fmt(p_val),
+            'Change':          diff(p_val, c_val),
+            'Change %':        pct_chg(p_val, c_val),
+        })
+
+    return pd.DataFrame(output)
+
+
+def build_standalone_rule_impact(df):
+    """
+    Test each rule in isolation.
+    Shows how many customers each individual rule would exclude
+    and the revenue / loan value at risk.
+    """
+    total = len(df)
+    rule_flag_map = [
+        ('Rule 1', ELIGIBILITY_RULES['rule1'], 'rule1_flag'),
+        ('Rule 2', ELIGIBILITY_RULES['rule2'], 'rule2_flag'),
+        ('Rule 3', ELIGIBILITY_RULES['rule3'], 'rule3_flag'),
+        ('Rule 4', ELIGIBILITY_RULES['rule4'], 'rule4_flag'),
+        ('Rule 5', ELIGIBILITY_RULES['rule5'], 'rule5_flag'),
+        ('Rule 6', ELIGIBILITY_RULES['rule6'], 'rule6_flag'),
+    ]
+
+    rows = []
+    for rule_id, rule_desc, flag_col in rule_flag_map:
+        fail_df = df[df[flag_col] == 0]
+        pass_df = df[df[flag_col] == 1]
+        fail_n  = len(fail_df)
+        rows.append({
+            'Rule':                          rule_id,
+            'Description':                   rule_desc,
+            'Customers Failing':             f'{fail_n:,}',
+            'Fail %':                        f'{fail_n / total * 100:.1f}%' if total > 0 else '–',
+            'Loan Value at Risk (UGX)':      f'{fail_df["loan_disb_amt_30d"].sum():,.0f}',
+            'Revenue at Risk (UGX)':         f'{fail_df["estimated_monthly_revenue"].sum():,.0f}',
+            'Avg DSI (failing)':             f'{fail_df["debt_stress_index"].mean():.1f}' if fail_n > 0 else '–',
+            'Avg Credit Loss Rate (failing)':f'{fail_df["expected_credit_loss_rate"].mean():.2f}' if fail_n > 0 else '–',
+            'Avg DSI (passing)':             f'{pass_df["debt_stress_index"].mean():.1f}' if len(pass_df) > 0 else '–',
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_scenario_comparison(df_base, scenarios, config):
+    """
+    Compare eligible customers and key metrics across threshold scenarios.
+    df_base should be the raw eligibility DataFrame before rules are applied.
+    """
+    rows = []
+    for key, scenario_cfg in scenarios.items():
+        s_df = apply_eligibility_rules(df_base, scenario_cfg, window_scale_factor=config.get('window_scale_factor', 1.0))
+        s_df = add_revenue_estimate(s_df, config)
+        eligible = s_df[s_df['proposed_eligible'] == 1]
+        n_elig   = len(eligible)
+        total    = len(s_df)
+
+        rows.append({
+            'Scenario':                  scenario_cfg['label'],
+            'Rule 3 Min Txns':           scenario_cfg['rule3_min_txns'],
+            'Rule 4 Min Value (UGX)':    f"{scenario_cfg['rule4_min_value']:,}",
+            'Rule 5 Overdue Days':        scenario_cfg['rule5_overdue_days'],
+            'Rule 6 Repay Delay (days)': scenario_cfg['rule6_repay_delay'],
+            'Eligible Customers':        f'{n_elig:,}',
+            'Eligible %':                f'{n_elig / total * 100:.1f}%' if total > 0 else '–',
+            'Total Loan Value (UGX)':    f'{eligible["loan_disb_amt_30d"].sum():,.0f}',
+            'Est. Revenue (UGX)':        f'{eligible["estimated_monthly_revenue"].sum():,.0f}',
+            'Avg DSI':                   f'{eligible["debt_stress_index"].mean():.1f}' if n_elig > 0 else '–',
+            'Avg Credit Loss Rate':      f'{eligible["expected_credit_loss_rate"].mean():.2f}' if n_elig > 0 else '–',
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_risk_segmentation(df):
+    """
+    Compare pass-all-rules vs fail-one-or-more segments on
+    financial and risk dimensions.
+    """
+    segments = {
+        'Pass all rules':         df[df['proposed_eligible'] == 1],
+        'Fail one or more rules': df[df['proposed_eligible'] == 0],
+    }
+
+    rows = []
+    for label, seg in segments.items():
+        n = len(seg)
+        if n == 0:
+            continue
+        borrowers = seg[seg['loan_disb_amt_30d'] > 0]
+        rows.append({
+            'Segment':                       label,
+            'Customers':                     f'{n:,}',
+            'Loan Count (30d disbursements)':f'{int(seg["disbursement_cnt_30d"].sum()):,}',
+            'Total Loan Value (UGX)':        f'{seg["loan_disb_amt_30d"].sum():,.0f}',
+            'Avg Loan Size (UGX)':           f'{borrowers["loan_disb_amt_30d"].mean():,.0f}' if len(borrowers) > 0 else '0',
+            'Est. Monthly Revenue (UGX)':    f'{seg["estimated_monthly_revenue"].sum():,.0f}',
+            'Avg Repayment Ratio':           f'{seg["repayment_ratio_30d"].mean():.2f}' if seg['repayment_ratio_30d'].notna().any() else '–',
+            'Avg DSI':                       f'{seg["debt_stress_index"].mean():.1f}',
+            'Avg Fraud Risk Score':          f'{seg["fraud_abuse_risk_score"].mean():.2f}',
+            'Avg Credit Loss Rate':          f'{seg["expected_credit_loss_rate"].mean():.2f}',
+            'Avg CLV Contribution':          f'{seg["clv_contribution"].mean():.2f}',
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_executive_summary(df, waterfall_df, config):
+    """One-page executive summary of the eligibility impact."""
+    total             = len(df)
+    n_current         = int(df['currently_eligible_flag'].sum())
+    n_proposed        = int(df['proposed_eligible'].sum())
+    net_change        = n_proposed - n_current
+    net_change_pct    = net_change / n_current * 100 if n_current > 0 else 0
+
+    rev_current       = df[df['currently_eligible_flag'] == 1]['estimated_monthly_revenue'].sum()
+    rev_proposed      = df[df['proposed_eligible'] == 1]['estimated_monthly_revenue'].sum()
+    rev_change        = rev_proposed - rev_current
+    rev_change_pct    = rev_change / rev_current * 100 if rev_current > 0 else 0
+
+    val_current       = df[df['currently_eligible_flag'] == 1]['loan_disb_amt_30d'].sum()
+    val_proposed      = df[df['proposed_eligible'] == 1]['loan_disb_amt_30d'].sum()
+    val_change_pct    = (val_proposed - val_current) / val_current * 100 if val_current > 0 else 0
+
+    dsi_current       = df[df['currently_eligible_flag'] == 1]['debt_stress_index'].mean()
+    dsi_proposed      = df[df['proposed_eligible'] == 1]['debt_stress_index'].mean()
+    loss_current      = df[df['currently_eligible_flag'] == 1]['expected_credit_loss_rate'].mean()
+    loss_proposed     = df[df['proposed_eligible'] == 1]['expected_credit_loss_rate'].mean()
+
+    # Most restrictive single rule (largest customer drop in waterfall)
+    wf = waterfall_df[waterfall_df['Step'] != 'Base'].copy()
+    wf['_dropped_num'] = wf['Customers Dropped'].str.replace(',', '').replace('–', '0').apply(
+        lambda x: int(x) if str(x).lstrip('+-').isdigit() else 0
+    )
+    most_restrictive = wf.loc[wf['_dropped_num'].idxmax(), 'Step'] if len(wf) > 0 else 'N/A'
+
+    metrics = [
+        ('Total addressable base',                  f'{total:,}'),
+        ('Currently eligible (existing engine)',     f'{n_current:,}'),
+        ('Proposed eligible (new rules)',            f'{n_proposed:,}'),
+        ('Net change in eligible customers',         f'{net_change:+,} ({net_change_pct:+.1f}%)'),
+        ('',                                         ''),
+        ('Est. monthly revenue – current (UGX)',     f'{rev_current:,.0f}'),
+        ('Est. monthly revenue – proposed (UGX)',    f'{rev_proposed:,.0f}'),
+        ('Revenue change (UGX)',                     f'{rev_change:+,.0f} ({rev_change_pct:+.1f}%)'),
+        (' ',                                        ''),
+        ('Loan disbursement value – current (UGX)',  f'{val_current:,.0f}'),
+        ('Loan disbursement value – proposed (UGX)', f'{val_proposed:,.0f}'),
+        ('Loan value change %',                      f'{val_change_pct:+.1f}%'),
+        ('  ',                                       ''),
+        ('Avg DSI – current eligible',               f'{dsi_current:.1f}'),
+        ('Avg DSI – proposed eligible',              f'{dsi_proposed:.1f}'),
+        ('Avg expected credit loss – current',       f'{loss_current:.2f}'),
+        ('Avg expected credit loss – proposed',      f'{loss_proposed:.2f}'),
+        ('   ',                                      ''),
+        ('Most restrictive rule',                    most_restrictive),
+        ('Data window',                              f'{config["data_window_days"]} days (April 2026)'),
+        ('Analysis note',                            'Rules 3 & 4: 30-day proxy for 90-day window. '
+                                                     'Rule 1: subscriber registry data required.'),
+    ]
+
+    return pd.DataFrame(metrics, columns=['Metric', 'Value'])
+
+
+# ============================================================
+# MAIN RUNNER
+# ============================================================
+
+def run_loan_eligibility_impact_analysis(eligibility_df, config=None, scenarios=None):
+    """
+    Full loan eligibility impact analysis pipeline.
+
+    Parameters
+    ----------
+    eligibility_df : pd.DataFrame
+        Output from vw_loan_eligibility_waterfall SQL view.
+    config : dict, optional
+        Overrides ANALYSIS_CONFIG defaults.
+    scenarios : dict, optional
+        Overrides SCENARIO_CONFIGS for sensitivity analysis.
+
+    Returns
+    -------
+    dict with keys:
+        executive_summary        : pd.DataFrame
+        eligibility_waterfall    : pd.DataFrame
+        impact_comparison        : pd.DataFrame
+        standalone_rule_impact   : pd.DataFrame
+        scenario_comparison      : pd.DataFrame
+        risk_segmentation        : pd.DataFrame
+        proposed_eligible_df     : pd.DataFrame  (filtered subset)
+        ineligible_df            : pd.DataFrame  (filtered subset)
+        full_analysis_df         : pd.DataFrame  (all subscribers with all flags)
+    """
+    local_config    = {**ANALYSIS_CONFIG,    **(config    or {})}
+    local_scenarios = {**SCENARIO_CONFIGS,   **(scenarios or {})}
+
+    validate_eligibility_df(eligibility_df)
+
+    df = eligibility_df.copy()
+    numeric_cols = [c for c in REQUIRED_ELIGIBILITY_COLS
+                    if c not in ('subscriber_msisdn', 'current_recommended_action')]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Apply proposed rules
+    df = apply_eligibility_rules(
+        df,
+        local_scenarios['proposed'],
+        window_scale_factor=local_config.get('window_scale_factor', 1.0),
+    )
+    df = add_revenue_estimate(df, local_config)
+
+    # Build all analysis tables
+    waterfall_df      = build_eligibility_waterfall(df)
+    impact_df         = build_impact_comparison(df)
+    standalone_df     = build_standalone_rule_impact(df)
+    scenario_df       = build_scenario_comparison(eligibility_df.copy(), local_scenarios, local_config)
+    risk_df           = build_risk_segmentation(df)
+    summary_df        = build_executive_summary(df, waterfall_df, local_config)
+
+    # ── Print all outputs ──────────────────────────────────────────
+    sep = '=' * 80
+
+    print(sep)
+    print('  LOAN ELIGIBILITY IMPACT ANALYSIS — BANKTECH')
+    print(f'  Data window: April 2026 (30 days)  |  Version: {local_config["output_version"]}')
+    print(sep)
+
+    print('\n── EXECUTIVE SUMMARY ──')
+    print(summary_df.to_string(index=False))
+
+    print('\n── ELIGIBILITY WATERFALL ──')
+    print(waterfall_df.to_string(index=False))
+
+    print('\n── CURRENT vs PROPOSED RULES — IMPACT COMPARISON ──')
+    print(impact_df.to_string(index=False))
+
+    print('\n── STANDALONE RULE IMPACT (each rule tested independently) ──')
+    print(standalone_df.to_string(index=False))
+
+    print('\n── SENSITIVITY SCENARIOS ──')
+    print(scenario_df.to_string(index=False))
+
+    print('\n── RISK SEGMENTATION: PASS vs FAIL ──')
+    print(risk_df.to_string(index=False))
+
+    return {
+        'executive_summary':      summary_df,
+        'eligibility_waterfall':  waterfall_df,
+        'impact_comparison':      impact_df,
+        'standalone_rule_impact': standalone_df,
+        'scenario_comparison':    scenario_df,
+        'risk_segmentation':      risk_df,
+        'proposed_eligible_df':   df[df['proposed_eligible'] == 1].copy(),
+        'ineligible_df':          df[df['proposed_eligible'] == 0].copy(),
+        'full_analysis_df':       df,
+    }
+
+
+# ============================================================
+# EXECUTE
+# ============================================================
+# Load eligibility_df from the SQL view before running:
+#
+#   eligibility_df = <query vw_loan_eligibility_waterfall into a DataFrame>
+#
+# Then run:
+impact_results = run_loan_eligibility_impact_analysis(eligibility_df)
+
+# Access individual output tables:
+impact_results['executive_summary']
+impact_results['eligibility_waterfall']
+impact_results['impact_comparison']
+impact_results['standalone_rule_impact']
+impact_results['scenario_comparison']
+impact_results['risk_segmentation']
