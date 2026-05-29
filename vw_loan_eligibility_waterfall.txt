@@ -3,45 +3,61 @@
 -- Applies the 6 agreed loan eligibility rules as a cumulative
 -- waterfall and flags each subscriber's eligibility status.
 --
+-- SOURCES: vw1_credit_v1_normalized_events (transaction-level)
+--          vw2_credit_v1_subscriber_day    (daily rollup)
+--          vw3_credit_v1_layer1_features   (30-day features)
+-- vw4 (scores), vw5 (reason codes), vw6 (decisions) are
+-- deliberately excluded as those views are not yet verified.
+--
 -- DATA LIMITATION NOTES:
---   Rule 1 (MoMo age >= 180 days): requires subscriber registration
---     date from an external registry table. This view marks all
---     subscribers as passing Rule 1 until that join is added.
---     See the placeholder comment in eligibility_base below.
---   Rules 3 & 4 (90-day windows): current dataset covers April 2026
---     (30 days). Metrics from vw1 are used as direct proxies.
---     To scale to full 90-day equivalents multiply by ~3 in the
---     Python analysis layer.
---   Rule 5 (overdue > 60 days): inferred from outstanding exposure,
---     days_since_last_repayment, and repayment_ratio_30d.
---   Rule 6 (cooling-off): inferred from active outstanding loan +
---     repayment delay + low repayment ratio.
+--   Rule 1 (MoMo age >= 180 days):
+--     Requires subscriber_registry.registration_dt from an
+--     external master table. This view marks all subscribers
+--     as passing Rule 1 (placeholder = 1) until that join is
+--     added. See the production comment in eligibility_base.
+--   Rules 3 & 4 (90-day windows):
+--     The current dataset covers April 2026 (30 days only).
+--     wallet_txn_cnt_30d and wallet_inflow/outflow_amt_30d
+--     from vw3 are used as direct proxies. When full 90-day
+--     history is loaded, extend the date range in vw1 and
+--     rebuild a 90-day CTE from vw2 instead.
+--   Rule 5 (overdue > 60 days):
+--     No loan contract table (due dates, loan_status) is
+--     available. Signal is proxied from outstanding_exposure_amt,
+--     days_since_last_repayment, and repayment_ratio_30d in vw3.
+--   Rule 6 (cooling-off after delayed repayment):
+--     Cannot determine whether a repayment was late without
+--     loan due dates. Proxied from outstanding exposure +
+--     repayment recency + repayment ratio in vw3.
 -- ============================================================
 
 CREATE OR REPLACE VIEW vw_loan_eligibility_waterfall AS
 
-WITH subscriber_first_activity AS (
+-- ── Base: all subscribers seen in the event stream ───────────
+WITH subscriber_base AS (
     SELECT
         subscriber_msisdn,
-        MIN(event_dt)          AS first_activity_dt,
-        MAX(event_dt)          AS last_activity_dt,
+        MIN(event_dt)            AS first_activity_dt,
+        MAX(event_dt)            AS last_activity_dt,
         COUNT(DISTINCT event_dt) AS total_active_days
     FROM vw1_credit_v1_normalized_events
     GROUP BY subscriber_msisdn
 ),
 
--- Rule 2: MAU30 – any transaction in the most recent 30 days
+-- ── Rule 2: MAU30 — any MoMo event in the last 30 days ───────
 mau30_activity AS (
     SELECT
         subscriber_msisdn,
-        COUNT(DISTINCT event_dt)                              AS active_days_last30d,
-        CASE WHEN COUNT(DISTINCT event_dt) >= 1 THEN 1 ELSE 0 END AS mau30_flag
+        COUNT(DISTINCT event_dt)                                      AS active_days_last30d,
+        CASE WHEN COUNT(DISTINCT event_dt) >= 1 THEN 1 ELSE 0 END    AS mau30_flag
     FROM vw1_credit_v1_normalized_events
     WHERE event_dt >= date_add('day', -29, DATE '2026-04-30')
     GROUP BY subscriber_msisdn
 ),
 
--- Rules 3 & 4: MoMo transaction count and cumulative value
+-- ── Rules 3 & 4: wallet transaction count and value ──────────
+-- Grain: one row per subscriber across the full available window.
+-- NOTE: this covers 30 days (April 2026), not the required 90.
 momo_activity AS (
     SELECT
         subscriber_msisdn,
@@ -52,22 +68,29 @@ momo_activity AS (
     GROUP BY subscriber_msisdn
 ),
 
--- Layer 1 features – most recent feature date per subscriber
+-- ── Layer 1: most-recent 30-day feature snapshot per subscriber
 layer1_latest AS (
     SELECT
         subscriber_msisdn,
         feature_dt,
         outstanding_exposure_amt,
         repayment_ratio_30d,
+        repayment_cnt_30d,
+        disbursement_cnt_30d,
         days_since_last_disbursement,
         days_since_last_repayment,
-        wallet_txn_cnt_30d,
+        last_disbursement_dt,
+        last_repayment_dt,
         wallet_inflow_amt_30d,
         wallet_outflow_amt_30d,
-        disbursement_cnt_30d,
+        wallet_txn_cnt_30d,
         wallet_active_days_30d,
         loan_disb_amt_30d,
-        loan_repaid_amt_30d
+        loan_repaid_amt_30d,
+        stacked_borrowing_flag_30d,
+        repeated_borrowing_flag_30d,
+        active_lender_cnt_30d,
+        alt_credit_active_flag_30d
     FROM (
         SELECT *,
             ROW_NUMBER() OVER (
@@ -79,159 +102,117 @@ layer1_latest AS (
     WHERE rn = 1
 ),
 
--- Layer 0 scores – most recent date per subscriber
-layer0_latest AS (
-    SELECT
-        subscriber_msisdn,
-        expected_repayment_probability_v1_rule,
-        expected_credit_loss_rate_v1_rule,
-        debt_stress_index_v1,
-        fraud_abuse_risk_score_v1_rule,
-        customer_lifetime_value_contribution_v1_rule,
-        behavior_consistency_score_v1_rule
-    FROM (
-        SELECT *,
-            ROW_NUMBER() OVER (
-                PARTITION BY subscriber_msisdn
-                ORDER BY feature_dt DESC
-            ) AS rn
-        FROM vw4_credit_v1_layer0_scores
-    ) t
-    WHERE rn = 1
-),
-
--- Current credit decision – most recent date per subscriber
-cap_latest AS (
-    SELECT
-        subscriber_msisdn,
-        conservative_credit_limit_v1,
-        recommended_action
-    FROM (
-        SELECT *,
-            ROW_NUMBER() OVER (
-                PARTITION BY subscriber_msisdn
-                ORDER BY feature_dt DESC
-            ) AS rn
-        FROM vw6_credit_v1_cap_and_action
-    ) t
-    WHERE rn = 1
-),
-
+-- ── Eligibility flags per subscriber ─────────────────────────
 eligibility_base AS (
     SELECT
-        fa.subscriber_msisdn,
-        fa.first_activity_dt,
-        fa.last_activity_dt,
-        fa.total_active_days,
+        sb.subscriber_msisdn,
+        sb.first_activity_dt,
+        sb.last_activity_dt,
+        sb.total_active_days,
 
         -- -------------------------------------------------------
         -- Rule 1: MoMo age >= 180 days
-        -- PRODUCTION IMPLEMENTATION: replace the CAST(1 ...) below
-        -- with the following join to your subscriber registry:
+        -- PRODUCTION: replace CAST(1 …) with a join to the
+        -- subscriber registry, e.g.:
         --   LEFT JOIN subscriber_registry sr
-        --       ON fa.subscriber_msisdn = sr.msisdn
+        --       ON sb.subscriber_msisdn = sr.msisdn
         -- and use:
-        --   CASE WHEN date_diff('day', sr.registration_dt, DATE '2026-04-30') >= 180
-        --        THEN 1 ELSE 0 END AS rule1_momo_age_180d_flag
+        --   CASE WHEN date_diff('day', sr.registration_dt,
+        --                       DATE '2026-04-30') >= 180
+        --        THEN 1 ELSE 0 END
         -- -------------------------------------------------------
-        CAST(1 AS INTEGER)                                  AS rule1_momo_age_180d_flag,
+        CAST(1 AS INTEGER)                                      AS rule1_momo_age_180d_flag,
 
-        -- Rule 2: MAU30
-        COALESCE(m30.mau30_flag, 0)                        AS rule2_mau30_flag,
-        COALESCE(m30.active_days_last30d, 0)               AS active_days_last30d,
+        -- Rule 2: MAU30 — active in last 30 days
+        COALESCE(m30.mau30_flag, 0)                            AS rule2_mau30_flag,
+        COALESCE(m30.active_days_last30d, 0)                   AS active_days_last30d,
 
         -- Rule 3: >= 5 MoMo transactions in 90 days (30-day proxy)
         CASE WHEN COALESCE(ma.momo_txn_cnt_30d, 0) >= 5
-             THEN 1 ELSE 0 END                             AS rule3_min_5txn_flag,
-        COALESCE(ma.momo_txn_cnt_30d, 0)                  AS momo_txn_cnt_30d,
+             THEN 1 ELSE 0 END                                 AS rule3_min_5txn_flag,
+        COALESCE(ma.momo_txn_cnt_30d, 0)                      AS momo_txn_cnt_30d,
 
-        -- Rule 4: >= UGX 10,000 cumulative inflow or outflow in 90 days (30-day proxy)
+        -- Rule 4: >= UGX 10,000 inflow or outflow in 90 days (30-day proxy)
         CASE WHEN   COALESCE(ma.momo_inflow_30d,  0) >= 10000
                OR   COALESCE(ma.momo_outflow_30d, 0) >= 10000
-             THEN 1 ELSE 0 END                             AS rule4_min_10k_value_flag,
-        COALESCE(ma.momo_inflow_30d,  0)                  AS momo_inflow_30d,
-        COALESCE(ma.momo_outflow_30d, 0)                  AS momo_outflow_30d,
+             THEN 1 ELSE 0 END                                 AS rule4_min_10k_value_flag,
+        COALESCE(ma.momo_inflow_30d,  0)                      AS momo_inflow_30d,
+        COALESCE(ma.momo_outflow_30d, 0)                      AS momo_outflow_30d,
 
         -- Rule 5: No active term loan overdue > 60 days
-        -- Proxy signal: outstanding exposure + gap since last repayment > 60d + very low ratio
+        -- Proxy: outstanding loan + last repayment > 60 days ago + very low ratio
         CASE WHEN l1.outstanding_exposure_amt > 0
               AND COALESCE(l1.days_since_last_repayment, 0)  > 60
               AND COALESCE(l1.repayment_ratio_30d,        0) < 0.10
-             THEN 0 ELSE 1 END                             AS rule5_no_overdue_60d_flag,
+             THEN 0 ELSE 1 END                                 AS rule5_no_overdue_60d_flag,
 
-        -- Rule 6: Not in cooling-off period (due_date + 30 days → 90-day cooldown)
-        -- Proxy signal: active outstanding loan + repayment delayed > 30d + low ratio
+        -- Rule 6: Not in cooling-off (due_date + 30 days → 90-day cooldown)
+        -- Proxy: active outstanding loan + repayment delayed > 30 days + low ratio
         CASE WHEN l1.outstanding_exposure_amt > 0
               AND COALESCE(l1.days_since_last_repayment, 0)  > 30
               AND COALESCE(l1.repayment_ratio_30d,        0) < 0.50
-             THEN 0 ELSE 1 END                             AS rule6_no_cooling_off_flag,
+             THEN 0 ELSE 1 END                                 AS rule6_no_cooling_off_flag,
 
-        -- Layer 1 financial features
-        COALESCE(l1.outstanding_exposure_amt,          0.0) AS outstanding_exposure_amt,
+        -- ── Financial features (from vw3) ──────────────────────
+        COALESCE(l1.outstanding_exposure_amt,          0.0)   AS outstanding_exposure_amt,
         l1.repayment_ratio_30d,
-        COALESCE(l1.wallet_inflow_amt_30d,             0.0) AS wallet_inflow_amt_30d,
-        COALESCE(l1.wallet_outflow_amt_30d,            0.0) AS wallet_outflow_amt_30d,
-        COALESCE(l1.wallet_txn_cnt_30d,                0)   AS wallet_txn_cnt_30d,
-        COALESCE(l1.disbursement_cnt_30d,              0)   AS disbursement_cnt_30d,
-        COALESCE(l1.loan_disb_amt_30d,                 0.0) AS loan_disb_amt_30d,
-        COALESCE(l1.loan_repaid_amt_30d,               0.0) AS loan_repaid_amt_30d,
+        COALESCE(l1.repayment_cnt_30d,                 0)     AS repayment_cnt_30d,
+        COALESCE(l1.disbursement_cnt_30d,              0)     AS disbursement_cnt_30d,
+        COALESCE(l1.wallet_inflow_amt_30d,             0.0)   AS wallet_inflow_amt_30d,
+        COALESCE(l1.wallet_outflow_amt_30d,            0.0)   AS wallet_outflow_amt_30d,
+        COALESCE(l1.wallet_txn_cnt_30d,                0)     AS wallet_txn_cnt_30d,
+        COALESCE(l1.wallet_active_days_30d,            0)     AS wallet_active_days_30d,
+        COALESCE(l1.loan_disb_amt_30d,                 0.0)   AS loan_disb_amt_30d,
+        COALESCE(l1.loan_repaid_amt_30d,               0.0)   AS loan_repaid_amt_30d,
         l1.days_since_last_disbursement,
         l1.days_since_last_repayment,
-        COALESCE(l1.wallet_active_days_30d,            0)   AS wallet_active_days_30d,
+        l1.last_disbursement_dt,
+        l1.last_repayment_dt,
+        COALESCE(l1.stacked_borrowing_flag_30d,        0)     AS stacked_borrowing_flag_30d,
+        COALESCE(l1.repeated_borrowing_flag_30d,       0)     AS repeated_borrowing_flag_30d,
+        COALESCE(l1.active_lender_cnt_30d,             0)     AS active_lender_cnt_30d,
+        COALESCE(l1.alt_credit_active_flag_30d,        0)     AS alt_credit_active_flag_30d
 
-        -- Layer 0 risk scores (defaults reflect thin-file/unknown subscriber)
-        COALESCE(l0.expected_repayment_probability_v1_rule,       0.25) AS expected_repayment_probability,
-        COALESCE(l0.expected_credit_loss_rate_v1_rule,            0.60) AS expected_credit_loss_rate,
-        COALESCE(l0.debt_stress_index_v1,                         0.0)  AS debt_stress_index,
-        COALESCE(l0.fraud_abuse_risk_score_v1_rule,               0.10) AS fraud_abuse_risk_score,
-        COALESCE(l0.customer_lifetime_value_contribution_v1_rule, 0.0)  AS clv_contribution,
-        COALESCE(l0.behavior_consistency_score_v1_rule,           0.25) AS behavior_consistency_score,
-
-        -- Current credit decision
-        COALESCE(c.conservative_credit_limit_v1, 0.0)       AS current_credit_limit,
-        c.recommended_action                                 AS current_recommended_action
-
-    FROM subscriber_first_activity fa
-    LEFT JOIN mau30_activity  m30 ON fa.subscriber_msisdn = m30.subscriber_msisdn
-    LEFT JOIN momo_activity   ma  ON fa.subscriber_msisdn = ma.subscriber_msisdn
-    LEFT JOIN layer1_latest   l1  ON fa.subscriber_msisdn = l1.subscriber_msisdn
-    LEFT JOIN layer0_latest   l0  ON fa.subscriber_msisdn = l0.subscriber_msisdn
-    LEFT JOIN cap_latest      c   ON fa.subscriber_msisdn = c.subscriber_msisdn
+    FROM subscriber_base sb
+    LEFT JOIN mau30_activity  m30 ON sb.subscriber_msisdn = m30.subscriber_msisdn
+    LEFT JOIN momo_activity   ma  ON sb.subscriber_msisdn = ma.subscriber_msisdn
+    LEFT JOIN layer1_latest   l1  ON sb.subscriber_msisdn = l1.subscriber_msisdn
 ),
 
+-- ── Waterfall: cumulative eligibility after each rule ─────────
 waterfall AS (
     SELECT
         *,
 
-        -- Current eligibility under existing engine rules
-        CASE WHEN COALESCE(current_recommended_action, 'RESTRICT') <> 'RESTRICT'
-              AND current_credit_limit > 0
-             THEN 1 ELSE 0 END                             AS currently_eligible_flag,
+        -- Baseline comparison group: subscriber had at least one
+        -- loan disbursement in the current 30-day window.
+        -- Used instead of "currently_eligible" (which required vw6).
+        CASE WHEN disbursement_cnt_30d > 0 THEN 1 ELSE 0 END  AS currently_active_borrower_flag,
 
-        -- Cumulative waterfall eligibility
-        rule1_momo_age_180d_flag                           AS eligible_after_rule1,
+        -- Cumulative waterfall
+        rule1_momo_age_180d_flag                               AS eligible_after_rule1,
 
         CASE WHEN rule1_momo_age_180d_flag = 1
               AND rule2_mau30_flag          = 1
-             THEN 1 ELSE 0 END                             AS eligible_after_rule2,
+             THEN 1 ELSE 0 END                                 AS eligible_after_rule2,
 
         CASE WHEN rule1_momo_age_180d_flag = 1
               AND rule2_mau30_flag          = 1
               AND rule3_min_5txn_flag       = 1
-             THEN 1 ELSE 0 END                             AS eligible_after_rule3,
+             THEN 1 ELSE 0 END                                 AS eligible_after_rule3,
 
         CASE WHEN rule1_momo_age_180d_flag = 1
               AND rule2_mau30_flag          = 1
               AND rule3_min_5txn_flag       = 1
               AND rule4_min_10k_value_flag  = 1
-             THEN 1 ELSE 0 END                             AS eligible_after_rule4,
+             THEN 1 ELSE 0 END                                 AS eligible_after_rule4,
 
         CASE WHEN rule1_momo_age_180d_flag = 1
               AND rule2_mau30_flag          = 1
               AND rule3_min_5txn_flag       = 1
               AND rule4_min_10k_value_flag  = 1
               AND rule5_no_overdue_60d_flag = 1
-             THEN 1 ELSE 0 END                             AS eligible_after_rule5,
+             THEN 1 ELSE 0 END                                 AS eligible_after_rule5,
 
         CASE WHEN rule1_momo_age_180d_flag = 1
               AND rule2_mau30_flag          = 1
@@ -239,12 +220,11 @@ waterfall AS (
               AND rule4_min_10k_value_flag  = 1
               AND rule5_no_overdue_60d_flag = 1
               AND rule6_no_cooling_off_flag = 1
-             THEN 1 ELSE 0 END                             AS proposed_eligible_flag,
+             THEN 1 ELSE 0 END                                 AS proposed_eligible_flag,
 
-        -- Revenue proxy: credit_limit * base_margin_rate (10%) * repayment_probability
-        current_credit_limit
-            * 0.10
-            * COALESCE(expected_repayment_probability, 0.25) AS estimated_monthly_revenue
+        -- Revenue proxy: actual disbursement value × 10% assumed margin.
+        -- No repayment probability multiplier — scores are not verified.
+        loan_disb_amt_30d * 0.10                               AS estimated_monthly_revenue
 
     FROM eligibility_base
 )
@@ -252,21 +232,23 @@ waterfall AS (
 SELECT
     subscriber_msisdn,
     first_activity_dt,
-    -- Individual rule flags
+    last_activity_dt,
+    total_active_days,
+    -- Rule flags
     rule1_momo_age_180d_flag,
     rule2_mau30_flag,
     rule3_min_5txn_flag,
     rule4_min_10k_value_flag,
     rule5_no_overdue_60d_flag,
     rule6_no_cooling_off_flag,
-    -- Waterfall pass/fail
+    -- Waterfall eligibility
     eligible_after_rule1,
     eligible_after_rule2,
     eligible_after_rule3,
     eligible_after_rule4,
     eligible_after_rule5,
     proposed_eligible_flag,
-    currently_eligible_flag,
+    currently_active_borrower_flag,
     -- Activity metrics
     active_days_last30d,
     momo_txn_cnt_30d,
@@ -275,25 +257,24 @@ SELECT
     -- Financial features
     outstanding_exposure_amt,
     repayment_ratio_30d,
+    repayment_cnt_30d,
+    disbursement_cnt_30d,
     wallet_inflow_amt_30d,
     wallet_outflow_amt_30d,
     wallet_txn_cnt_30d,
-    disbursement_cnt_30d,
+    wallet_active_days_30d,
     loan_disb_amt_30d,
     loan_repaid_amt_30d,
     days_since_last_disbursement,
     days_since_last_repayment,
-    wallet_active_days_30d,
-    -- Risk scores
-    expected_repayment_probability,
-    expected_credit_loss_rate,
-    debt_stress_index,
-    fraud_abuse_risk_score,
-    clv_contribution,
-    behavior_consistency_score,
-    -- Current credit decision
-    current_credit_limit,
-    current_recommended_action,
+    last_disbursement_dt,
+    last_repayment_dt,
+    -- Risk behaviour flags (from vw3, no scoring)
+    stacked_borrowing_flag_30d,
+    repeated_borrowing_flag_30d,
+    active_lender_cnt_30d,
+    alt_credit_active_flag_30d,
+    -- Revenue estimate
     estimated_monthly_revenue
 
 FROM waterfall
