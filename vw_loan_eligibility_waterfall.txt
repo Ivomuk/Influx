@@ -3,32 +3,40 @@
 -- Applies the 6 agreed loan eligibility rules as a cumulative
 -- waterfall and flags each subscriber's eligibility status.
 --
--- SOURCES: vw1_credit_v1_normalized_events (transaction-level)
---          vw2_credit_v1_subscriber_day    (daily rollup)
---          vw3_credit_v1_layer1_features   (30-day features)
+-- SOURCES:
+--   vw1_credit_v1_normalized_events            (transaction-level)
+--   vw2_credit_v1_subscriber_day               (daily rollup)
+--   vw3_credit_v1_layer1_features              (30-day features)
+--   wamujap.fm_momo_loan_portfolio_cummulation (loan portfolio)
 -- vw4 (scores), vw5 (reason codes), vw6 (decisions) are
 -- deliberately excluded as those views are not yet verified.
 --
 -- DATA LIMITATION NOTES:
 --   Rule 1 (MoMo age >= 180 days):
 --     Requires subscriber_registry.registration_dt from an
---     external master table. This view marks all subscribers
---     as passing Rule 1 (placeholder = 1) until that join is
---     added. See the production comment in eligibility_base.
+--     external master table. All subscribers pass Rule 1
+--     (placeholder = 1) until that join is added.
+--     See the production comment in eligibility_base below.
 --   Rules 3 & 4 (90-day windows):
---     The current dataset covers April 2026 (30 days only).
---     wallet_txn_cnt_30d and wallet_inflow/outflow_amt_30d
---     from vw3 are used as direct proxies. When full 90-day
---     history is loaded, extend the date range in vw1 and
---     rebuild a 90-day CTE from vw2 instead.
+--     Dataset covers April 2026 (30 days only). wallet_txn_cnt_30d
+--     and wallet_inflow/outflow_amt_30d from vw3 are used as
+--     direct proxies. Extend the date range in vw1 and rebuild
+--     a 90-day CTE from vw2 when full history is available.
 --   Rule 5 (overdue > 60 days):
---     No loan contract table (due dates, loan_status) is
---     available. Signal is proxied from outstanding_exposure_amt,
---     days_since_last_repayment, and repayment_ratio_30d in vw3.
+--     Source: wamujap.fm_momo_loan_portfolio_cummulation
+--     (loan_repaid = 0, tbl_dt = 20260331).
+--     Assumption: a loan outstanding for > 60 days from its
+--     disbursement date is treated as overdue. No due_date
+--     column exists in the source table; this implicitly assumes
+--     a 30-day standard loan term across all providers.
+--     Update tbl_dt to 20260430 when that snapshot is available.
 --   Rule 6 (cooling-off after delayed repayment):
---     Cannot determine whether a repayment was late without
---     loan due dates. Proxied from outstanding exposure +
---     repayment recency + repayment ratio in vw3.
+--     Source: wamujap.fm_momo_loan_portfolio_cummulation
+--     (loan_repaid = 1, tbl_dt = 20260331).
+--     Assumption: days from disbursement to repayment > 30 is
+--     treated as a late repayment (same 30-day term assumption).
+--     Cooling-off window = 90 days from repayment date.
+--     Update tbl_dt to 20260430 when that snapshot is available.
 -- ============================================================
 
 CREATE OR REPLACE VIEW vw_loan_eligibility_waterfall AS
@@ -57,7 +65,7 @@ mau30_activity AS (
 
 -- ── Rules 3 & 4: wallet transaction count and value ──────────
 -- Grain: one row per subscriber across the full available window.
--- NOTE: this covers 30 days (April 2026), not the required 90.
+-- NOTE: covers 30 days (April 2026), not the required 90 days.
 momo_activity AS (
     SELECT
         subscriber_msisdn,
@@ -102,6 +110,68 @@ layer1_latest AS (
     WHERE rn = 1
 ),
 
+-- ── Rule 5: overdue loans (active, unrepaid, > 60 days old) ──
+-- Grain: one row per msisdn with any overdue loan.
+-- Source: fm_momo_loan_portfolio_cummulation snapshot 20260331.
+-- Update tbl_dt to 20260430 when that snapshot is available.
+loan_overdue_signals AS (
+    SELECT
+        msisdn,
+        COUNT(DISTINCT loan_id)                                       AS overdue_loan_count,
+        SUM(outstanding_loan)                                         AS total_overdue_amount,
+        MAX(date_diff('day', disbursement_date, snapshot_date))       AS max_days_outstanding,
+        1                                                             AS overdue_60d_flag
+    FROM (
+        SELECT
+            msisdn,
+            loan_id,
+            outstanding_loan,
+            CAST(date_parse(CAST(disbursement_date AS VARCHAR), '%Y%m%d') AS DATE) AS disbursement_date,
+            CAST(date_parse(CAST(tbl_dt            AS VARCHAR), '%Y%m%d') AS DATE) AS snapshot_date
+        FROM wamujap.fm_momo_loan_portfolio_cummulation
+        WHERE tbl_dt              = 20260331   -- update to 20260430 when available
+          AND loan_repaid         = 0          -- active / unrepaid loans only
+          AND disbursement_date   IS NOT NULL
+    ) t
+    WHERE outstanding_loan > 0
+      AND date_diff('day', disbursement_date, snapshot_date) > 60
+    GROUP BY msisdn
+),
+
+-- ── Rule 6: cooling-off after late repayment ──────────────────
+-- Grain: one row per msisdn currently inside a cooling-off window.
+-- Source: fm_momo_loan_portfolio_cummulation snapshot 20260331.
+-- Assumption: loan term = 30 days. "Late" = days_to_repay > 30.
+-- Cooling-off = 90 days from repayment date.
+-- Update tbl_dt to 20260430 when that snapshot is available.
+loan_cooling_off_signals AS (
+    SELECT
+        msisdn,
+        COUNT(DISTINCT loan_id)                            AS cooling_off_loan_count,
+        MAX(repayment_date)                                AS latest_late_repayment_date,
+        MAX(date_add('day', 90, repayment_date))           AS latest_cooling_off_end_date,
+        SUM(loan_disbursed)                                AS cooling_off_affected_loan_value,
+        1                                                  AS cooling_off_flag
+    FROM (
+        SELECT
+            msisdn,
+            loan_id,
+            loan_disbursed,
+            CAST(date_parse(CAST(disbursement_date AS VARCHAR), '%Y%m%d') AS DATE) AS disbursement_date,
+            CAST(date_parse(CAST(repayment_date    AS VARCHAR), '%Y%m%d') AS DATE) AS repayment_date,
+            CAST(date_parse(CAST(tbl_dt            AS VARCHAR), '%Y%m%d') AS DATE) AS snapshot_date
+        FROM wamujap.fm_momo_loan_portfolio_cummulation
+        WHERE tbl_dt            = 20260331   -- update to 20260430 when available
+          AND loan_repaid       = 1          -- closed / repaid loans only
+          AND repayment_date    IS NOT NULL
+          AND disbursement_date IS NOT NULL
+    ) t
+    WHERE date_diff('day', disbursement_date, repayment_date) > 30   -- late repayment proxy
+      AND snapshot_date BETWEEN repayment_date
+                            AND date_add('day', 90, repayment_date)  -- inside cooling window
+    GROUP BY msisdn
+),
+
 -- ── Eligibility flags per subscriber ─────────────────────────
 eligibility_base AS (
     SELECT
@@ -140,18 +210,12 @@ eligibility_base AS (
         COALESCE(ma.momo_outflow_30d, 0)                      AS momo_outflow_30d,
 
         -- Rule 5: No active term loan overdue > 60 days
-        -- Proxy: outstanding loan + last repayment > 60 days ago + very low ratio
-        CASE WHEN l1.outstanding_exposure_amt > 0
-              AND COALESCE(l1.days_since_last_repayment, 0)  > 60
-              AND COALESCE(l1.repayment_ratio_30d,        0) < 0.10
-             THEN 0 ELSE 1 END                                 AS rule5_no_overdue_60d_flag,
+        -- Source: loan_overdue_signals (fm_momo_loan_portfolio_cummulation)
+        CASE WHEN lov.overdue_60d_flag = 1 THEN 0 ELSE 1 END  AS rule5_no_overdue_60d_flag,
 
-        -- Rule 6: Not in cooling-off (due_date + 30 days → 90-day cooldown)
-        -- Proxy: active outstanding loan + repayment delayed > 30 days + low ratio
-        CASE WHEN l1.outstanding_exposure_amt > 0
-              AND COALESCE(l1.days_since_last_repayment, 0)  > 30
-              AND COALESCE(l1.repayment_ratio_30d,        0) < 0.50
-             THEN 0 ELSE 1 END                                 AS rule6_no_cooling_off_flag,
+        -- Rule 6: Not in cooling-off period
+        -- Source: loan_cooling_off_signals (fm_momo_loan_portfolio_cummulation)
+        CASE WHEN lco.cooling_off_flag = 1 THEN 0 ELSE 1 END  AS rule6_no_cooling_off_flag,
 
         -- ── Financial features (from vw3) ──────────────────────
         COALESCE(l1.outstanding_exposure_amt,          0.0)   AS outstanding_exposure_amt,
@@ -171,12 +235,23 @@ eligibility_base AS (
         COALESCE(l1.stacked_borrowing_flag_30d,        0)     AS stacked_borrowing_flag_30d,
         COALESCE(l1.repeated_borrowing_flag_30d,       0)     AS repeated_borrowing_flag_30d,
         COALESCE(l1.active_lender_cnt_30d,             0)     AS active_lender_cnt_30d,
-        COALESCE(l1.alt_credit_active_flag_30d,        0)     AS alt_credit_active_flag_30d
+        COALESCE(l1.alt_credit_active_flag_30d,        0)     AS alt_credit_active_flag_30d,
+
+        -- ── Loan portfolio signals (from fm_momo_loan_portfolio_cummulation)
+        COALESCE(lov.overdue_loan_count,               0)     AS overdue_loan_count,
+        COALESCE(lov.total_overdue_amount,             0.0)   AS total_overdue_amount,
+        COALESCE(lov.max_days_outstanding,             0)     AS max_days_outstanding,
+        COALESCE(lco.cooling_off_loan_count,           0)     AS cooling_off_loan_count,
+        COALESCE(lco.cooling_off_affected_loan_value,  0.0)   AS cooling_off_affected_loan_value,
+        lco.latest_late_repayment_date,
+        lco.latest_cooling_off_end_date
 
     FROM subscriber_base sb
-    LEFT JOIN mau30_activity  m30 ON sb.subscriber_msisdn = m30.subscriber_msisdn
-    LEFT JOIN momo_activity   ma  ON sb.subscriber_msisdn = ma.subscriber_msisdn
-    LEFT JOIN layer1_latest   l1  ON sb.subscriber_msisdn = l1.subscriber_msisdn
+    LEFT JOIN mau30_activity           m30 ON sb.subscriber_msisdn = m30.subscriber_msisdn
+    LEFT JOIN momo_activity             ma ON sb.subscriber_msisdn = ma.subscriber_msisdn
+    LEFT JOIN layer1_latest             l1 ON sb.subscriber_msisdn = l1.subscriber_msisdn
+    LEFT JOIN loan_overdue_signals     lov ON sb.subscriber_msisdn = lov.msisdn
+    LEFT JOIN loan_cooling_off_signals lco ON sb.subscriber_msisdn = lco.msisdn
 ),
 
 -- ── Waterfall: cumulative eligibility after each rule ─────────
@@ -254,7 +329,7 @@ SELECT
     momo_txn_cnt_30d,
     momo_inflow_30d,
     momo_outflow_30d,
-    -- Financial features
+    -- Financial features (vw3)
     outstanding_exposure_amt,
     repayment_ratio_30d,
     repayment_cnt_30d,
@@ -269,11 +344,19 @@ SELECT
     days_since_last_repayment,
     last_disbursement_dt,
     last_repayment_dt,
-    -- Risk behaviour flags (from vw3, no scoring)
+    -- Risk behaviour flags (vw3)
     stacked_borrowing_flag_30d,
     repeated_borrowing_flag_30d,
     active_lender_cnt_30d,
     alt_credit_active_flag_30d,
+    -- Loan portfolio signals (fm_momo_loan_portfolio_cummulation)
+    overdue_loan_count,
+    total_overdue_amount,
+    max_days_outstanding,
+    cooling_off_loan_count,
+    cooling_off_affected_loan_value,
+    latest_late_repayment_date,
+    latest_cooling_off_end_date,
     -- Revenue estimate
     estimated_monthly_revenue
 

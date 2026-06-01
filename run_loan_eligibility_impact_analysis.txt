@@ -5,7 +5,7 @@
 # proposed BankTech loan eligibility rules on revenue, customers,
 # loan value, and loan volume.
 #
-# SOURCES: vw1 / vw2 / vw3 only.
+# SOURCES: vw1 / vw2 / vw3 / wamujap.fm_momo_loan_portfolio_cummulation.
 # vw4 (scores), vw5 (reason codes), vw6 (decisions) are
 # deliberately excluded as those views are not yet verified.
 #
@@ -18,8 +18,12 @@
 #   Rule 1: Placeholder (all pass). Needs subscriber_registry.registration_dt.
 #   Rules 3 & 4: 30-day proxy for 90-day rule. Set window_scale_factor=3.0
 #     in apply_eligibility_rules() when full 90-day history is available.
-#   Rules 5 & 6: Proxy signals from vw3. Needs loan contract table
-#     with due_date and loan_status for accurate overdue / cooling-off detection.
+#   Rule 5: Derived from fm_momo_loan_portfolio_cummulation (loan_repaid=0).
+#     Assumes 30-day loan term; no due_date column in source table.
+#     tbl_dt=20260331 — update to 20260430 when that snapshot is available.
+#   Rule 6: Derived from fm_momo_loan_portfolio_cummulation (loan_repaid=1).
+#     Late repayment proxy: days from disbursement to repayment > 30 days.
+#     Same 30-day term assumption and tbl_dt caveat as Rule 5.
 #   Revenue: loan_disb_amt_30d × base_margin_rate. No repayment probability
 #     multiplier — scores from vw4 are not yet verified.
 # ============================================================
@@ -39,7 +43,7 @@ ANALYSIS_CONFIG = {
     # Multiply 30-day txn/value metrics to approximate 90-day equivalent.
     # Set to 3.0 when 90-day history is available; keep at 1.0 for current data.
     'window_scale_factor': 1.0,
-    'output_version': 'loan_eligibility_impact_v2_no_scores',
+    'output_version': 'loan_eligibility_impact_v3_loan_portfolio',
 }
 
 ELIGIBILITY_RULES = {
@@ -75,6 +79,12 @@ REQUIRED_ELIGIBILITY_COLS = [
     'repeated_borrowing_flag_30d',
     'active_lender_cnt_30d',
     'currently_active_borrower_flag',
+    # Loan portfolio columns (from fm_momo_loan_portfolio_cummulation via SQL view).
+    # Used for diagnostic display; rule flags for R5/R6 are pre-computed in the SQL view.
+    'overdue_loan_count',
+    'total_overdue_amount',
+    'cooling_off_loan_count',
+    'cooling_off_affected_loan_value',
 ]
 
 # Three threshold scenarios for sensitivity analysis
@@ -156,21 +166,31 @@ def apply_eligibility_rules(df, scenario_cfg, window_scale_factor=1.0):
         (out['momo_outflow_30d'] * window_scale_factor >= scenario_cfg['rule4_min_value'])
     ).astype(int)
 
-    # Rule 5: No active term loan overdue > overdue_days
-    overdue = (
-        (out['outstanding_exposure_amt'] > 0) &
-        (out['days_since_last_repayment'].fillna(0) > scenario_cfg['rule5_overdue_days']) &
-        (out['repayment_ratio_30d'].fillna(0) < 0.10)
-    )
-    out['rule5_flag'] = (~overdue).astype(int)
+    # Rule 5: No active term loan overdue > 60 days.
+    # Preferred: use pre-computed flag from the loan portfolio table (SQL view).
+    # Fallback: vw3 proxy if loan portfolio columns are not present.
+    if 'rule5_no_overdue_60d_flag' in out.columns:
+        out['rule5_flag'] = out['rule5_no_overdue_60d_flag'].fillna(1).astype(int)
+    else:
+        overdue = (
+            (out['outstanding_exposure_amt'] > 0) &
+            (out['days_since_last_repayment'].fillna(0) > scenario_cfg['rule5_overdue_days']) &
+            (out['repayment_ratio_30d'].fillna(0) < 0.10)
+        )
+        out['rule5_flag'] = (~overdue).astype(int)
 
-    # Rule 6: Not in cooling-off
-    cooling = (
-        (out['outstanding_exposure_amt'] > 0) &
-        (out['days_since_last_repayment'].fillna(0) > scenario_cfg['rule6_repay_delay']) &
-        (out['repayment_ratio_30d'].fillna(0) < scenario_cfg['rule6_ratio_cap'])
-    )
-    out['rule6_flag'] = (~cooling).astype(int)
+    # Rule 6: Not in cooling-off period.
+    # Preferred: use pre-computed flag from the loan portfolio table (SQL view).
+    # Fallback: vw3 proxy if loan portfolio columns are not present.
+    if 'rule6_no_cooling_off_flag' in out.columns:
+        out['rule6_flag'] = out['rule6_no_cooling_off_flag'].fillna(1).astype(int)
+    else:
+        cooling = (
+            (out['outstanding_exposure_amt'] > 0) &
+            (out['days_since_last_repayment'].fillna(0) > scenario_cfg['rule6_repay_delay']) &
+            (out['repayment_ratio_30d'].fillna(0) < scenario_cfg['rule6_ratio_cap'])
+        )
+        out['rule6_flag'] = (~cooling).astype(int)
 
     # Cumulative waterfall flags
     out['eligible_after_rule1'] = out['rule1_flag']
@@ -386,18 +406,23 @@ def build_risk_segmentation(df):
         if n == 0:
             continue
         rows.append({
-            'Segment':                          label,
-            'Customers':                        f'{n:,}',
-            'Loan Count (30d disbursements)':   f'{int(seg["disbursement_cnt_30d"].sum()):,}',
-            'Total Loan Value (UGX)':           f'{seg["loan_disb_amt_30d"].sum():,.0f}',
-            'Avg Loan Size (UGX)':              f'{borrowers["loan_disb_amt_30d"].mean():,.0f}' if len(borrowers) > 0 else '0',
-            'Est. Monthly Revenue (UGX)':       f'{seg["estimated_monthly_revenue"].sum():,.0f}',
-            'Avg Repayment Ratio':              f'{seg["repayment_ratio_30d"].mean():.2f}' if seg['repayment_ratio_30d'].notna().any() else '–',
-            'Avg Outstanding Exposure (UGX)':   f'{seg["outstanding_exposure_amt"].mean():,.0f}',
-            'Avg Days Since Last Repayment':    f'{seg["days_since_last_repayment"].mean():.0f}' if seg['days_since_last_repayment'].notna().any() else '–',
-            'Stacked Borrowing Rate %':         f'{seg["stacked_borrowing_flag_30d"].mean() * 100:.1f}%',
-            'Repeated Borrowing Rate %':        f'{seg["repeated_borrowing_flag_30d"].mean() * 100:.1f}%',
-            'Avg Wallet Inflow (UGX)':          f'{seg["wallet_inflow_amt_30d"].mean():,.0f}',
+            'Segment':                                label,
+            'Customers':                              f'{n:,}',
+            'Loan Count (30d disbursements)':         f'{int(seg["disbursement_cnt_30d"].sum()):,}',
+            'Total Loan Value (UGX)':                 f'{seg["loan_disb_amt_30d"].sum():,.0f}',
+            'Avg Loan Size (UGX)':                    f'{borrowers["loan_disb_amt_30d"].mean():,.0f}' if len(borrowers) > 0 else '0',
+            'Est. Monthly Revenue (UGX)':             f'{seg["estimated_monthly_revenue"].sum():,.0f}',
+            'Avg Repayment Ratio':                    f'{seg["repayment_ratio_30d"].mean():.2f}' if seg['repayment_ratio_30d'].notna().any() else '–',
+            'Avg Outstanding Exposure (UGX)':         f'{seg["outstanding_exposure_amt"].mean():,.0f}',
+            'Avg Days Since Last Repayment':          f'{seg["days_since_last_repayment"].mean():.0f}' if seg['days_since_last_repayment'].notna().any() else '–',
+            'Stacked Borrowing Rate %':               f'{seg["stacked_borrowing_flag_30d"].mean() * 100:.1f}%',
+            'Repeated Borrowing Rate %':              f'{seg["repeated_borrowing_flag_30d"].mean() * 100:.1f}%',
+            'Avg Wallet Inflow (UGX)':                f'{seg["wallet_inflow_amt_30d"].mean():,.0f}',
+            # Loan portfolio signals
+            'Customers with overdue loans':           f'{int((seg["overdue_loan_count"] > 0).sum()):,}',
+            'Total overdue loan exposure (UGX)':      f'{seg["total_overdue_amount"].sum():,.0f}',
+            'Customers in cooling-off':               f'{int((seg["cooling_off_loan_count"] > 0).sum()):,}',
+            'Cooling-off affected loan value (UGX)':  f'{seg["cooling_off_affected_loan_value"].sum():,.0f}',
         })
 
     return pd.DataFrame(rows)
@@ -456,12 +481,23 @@ def build_executive_summary(df, waterfall_df, config):
         ('Avg outstanding exposure – proposed (UGX)',   f'{exp_proposed:,.0f}' if pd.notna(exp_proposed) else '–'),
         ('   ',                                         ''),
         ('Most restrictive rule',                       most_restrictive),
+        ('   ',                                         ''),
+        # Loan portfolio summary (from fm_momo_loan_portfolio_cummulation)
+        ('Customers excluded by Rule 5 (overdue)',
+         f'{int((df["overdue_loan_count"] > 0).sum()):,}'),
+        ('Total overdue exposure removed (UGX)',
+         f'{df["total_overdue_amount"].sum():,.0f}'),
+        ('Customers excluded by Rule 6 (cooling-off)',
+         f'{int((df["cooling_off_loan_count"] > 0).sum()):,}'),
+        ('Cooling-off affected loan value (UGX)',
+         f'{df["cooling_off_affected_loan_value"].sum():,.0f}'),
+        ('    ',                                        ''),
         ('Data window',                                 f'{config["data_window_days"]} days (April 2026)'),
-        ('Sources used',                                'vw1, vw2, vw3 only (scores/decisions excluded)'),
+        ('Sources used',                                'vw1, vw2, vw3, fm_momo_loan_portfolio_cummulation'),
         ('Revenue method',                              'loan_disb_amt_30d × 10% margin (no score multiplier)'),
         ('Rule 1 status',                               'Placeholder — needs subscriber_registry.registration_dt'),
         ('Rules 3 & 4 status',                         '30-day proxy for 90-day window'),
-        ('Rules 5 & 6 status',                         'Proxy signals — needs loan contract due dates'),
+        ('Rules 5 & 6 status',                         'Loan portfolio table — assumes 30-day loan term (no due_date)'),
     ]
 
     return pd.DataFrame(metrics, columns=['Metric', 'Value'])
@@ -529,7 +565,7 @@ def run_loan_eligibility_impact_analysis(eligibility_df, config=None, scenarios=
     print(sep)
     print('  LOAN ELIGIBILITY IMPACT ANALYSIS — BANKTECH')
     print(f'  Data window: April 2026 (30d)  |  Version: {local_config["output_version"]}')
-    print('  Sources: vw1, vw2, vw3 only. Scores and decisions excluded.')
+    print('  Sources: vw1, vw2, vw3, fm_momo_loan_portfolio_cummulation. Scores/decisions excluded.')
     print(sep)
 
     print('\n── EXECUTIVE SUMMARY ──')
