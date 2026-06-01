@@ -15,7 +15,8 @@
 #          risk segmentation | executive summary
 #
 # DATA LIMITATION NOTES:
-#   Rule 1: Placeholder (all pass). Needs subscriber_registry.registration_dt.
+#   Rule 1: Connected to devdata.account_holder_dump (registration_date / activation_date,
+#     both VARCHAR YYYYMMDD). Falls back to first_activity_dt from vw1 when both are NULL.
 #   Rules 3 & 4: 30-day proxy for 90-day rule. Set window_scale_factor=3.0
 #     in apply_eligibility_rules() when full 90-day history is available.
 #   Rule 5: Derived from fm_momo_loan_portfolio_cummulation (loan_repaid=0).
@@ -43,7 +44,7 @@ ANALYSIS_CONFIG = {
     # Multiply 30-day txn/value metrics to approximate 90-day equivalent.
     # Set to 3.0 when 90-day history is available; keep at 1.0 for current data.
     'window_scale_factor': 1.0,
-    'output_version': 'loan_eligibility_impact_v3_loan_portfolio',
+    'output_version': 'loan_eligibility_impact_v4_rule1_date_params',
 }
 
 ELIGIBILITY_RULES = {
@@ -461,6 +462,15 @@ def build_executive_summary(df, waterfall_df, config):
     )
     most_restrictive = wf.loc[wf['_dropped_num'].idxmax(), 'Step'] if len(wf) > 0 else 'N/A'
 
+    # Rule 1 exclusion count (now live from account_holder_dump)
+    r1_excluded = int((df['rule1_momo_age_180d_flag'] == 0).sum()) \
+        if 'rule1_momo_age_180d_flag' in df.columns else None
+    r1_status = (
+        f'Active — account_holder_dump connected ({r1_excluded:,} excluded)'
+        if r1_excluded is not None
+        else 'Pending — rule1_momo_age_180d_flag not in dataset'
+    )
+
     metrics = [
         ('Total addressable subscriber base',           f'{total:,}'),
         ('Currently active borrowers (baseline)',       f'{n_active:,}'),
@@ -482,6 +492,9 @@ def build_executive_summary(df, waterfall_df, config):
         ('   ',                                         ''),
         ('Most restrictive rule',                       most_restrictive),
         ('   ',                                         ''),
+        # Rule 1 exclusions (from devdata.account_holder_dump)
+        ('Customers excluded by Rule 1 (MoMo age < 180 days)',
+         f'{r1_excluded:,}' if r1_excluded is not None else 'Pending'),
         # Loan portfolio summary (from fm_momo_loan_portfolio_cummulation)
         ('Customers excluded by Rule 5 (overdue)',
          f'{int((df["overdue_loan_count"] > 0).sum()):,}'),
@@ -493,11 +506,11 @@ def build_executive_summary(df, waterfall_df, config):
          f'{df["cooling_off_affected_loan_value"].sum():,.0f}'),
         ('    ',                                        ''),
         ('Data window',                                 f'{config["data_window_days"]} days (April 2026)'),
-        ('Sources used',                                'vw1, vw2, vw3, fm_momo_loan_portfolio_cummulation'),
+        ('Sources used',                                'vw1, vw2, vw3, account_holder_dump, fm_momo_loan_portfolio_cummulation'),
         ('Revenue method',                              'loan_disb_amt_30d × 10% margin (no score multiplier)'),
-        ('Rule 1 status',                               'Placeholder — needs subscriber_registry.registration_dt'),
-        ('Rules 3 & 4 status',                         '30-day proxy for 90-day window'),
-        ('Rules 5 & 6 status',                         'Loan portfolio table — assumes 30-day loan term (no due_date)'),
+        ('Rule 1 status',                               r1_status),
+        ('Rules 3 & 4 status',                         '30-day proxy for 90-day window (extend window_90d_start in params CTE)'),
+        ('Rules 5 & 6 status',                         'Loan portfolio table — 30-day loan term confirmed'),
     ]
 
     return pd.DataFrame(metrics, columns=['Metric', 'Value'])

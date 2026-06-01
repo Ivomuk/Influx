@@ -4,6 +4,7 @@
 -- waterfall and flags each subscriber's eligibility status.
 --
 -- SOURCES:
+--   devdata.account_holder_dump                (subscriber registration)
 --   vw1_credit_v1_normalized_events            (transaction-level)
 --   vw2_credit_v1_subscriber_day               (daily rollup)
 --   vw3_credit_v1_layer1_features              (30-day features)
@@ -13,36 +14,65 @@
 --
 -- DATA LIMITATION NOTES:
 --   Rule 1 (MoMo age >= 180 days):
---     Requires subscriber_registry.registration_dt from an
---     external master table. All subscribers pass Rule 1
---     (placeholder = 1) until that join is added.
---     See the production comment in eligibility_base below.
---   Rules 3 & 4 (90-day windows):
---     Dataset covers April 2026 (30 days only). wallet_txn_cnt_30d
---     and wallet_inflow/outflow_amt_30d from vw3 are used as
---     direct proxies. Extend the date range in vw1 and rebuild
---     a 90-day CTE from vw2 when full history is available.
+--     Source: devdata.account_holder_dump (account_type='MOBILE MONEY',
+--     account_status='ACTIVE'). Derivation priority:
+--       1. registration_date  (date simcard was purchased)
+--       2. activation_date    (date first PIN reset was made)
+--       3. first_activity_dt  (earliest vw1 transaction — fallback only)
+--     registration_date and activation_date are VARCHAR YYYYMMDD ('20260401').
+--     Parsed via date_parse(col, '%Y%m%d') with TRY() to handle nulls.
+--   Rules 3 & 4 (transaction count / value windows):
+--     Controlled by params.window_90d_start and params.analysis_end_date.
+--     Currently set to a 30-day window (April 2026 data only).
+--     To extend to 90 days: change window_90d_start to DATE '2026-02-01'
+--     in the params CTE — no other changes needed.
 --   Rule 5 (overdue > 60 days):
---     Source: wamujap.fm_momo_loan_portfolio_cummulation
---     (loan_repaid = 0, tbl_dt = 20260331).
---     Assumption: a loan outstanding for > 60 days from its
---     disbursement date is treated as overdue. No due_date
---     column exists in the source table; this implicitly assumes
---     a 30-day standard loan term across all providers.
---     Update tbl_dt to 20260430 when that snapshot is available.
+--     Source: wamujap.fm_momo_loan_portfolio_cummulation (loan_repaid=0).
+--     Overdue measured from disbursement_date to analysis_end_date.
+--     No due_date column in source; 30-day loan term assumed (confirmed).
+--     Update loan_snapshot_tbl_dt in params to 20260430 when available.
 --   Rule 6 (cooling-off after delayed repayment):
---     Source: wamujap.fm_momo_loan_portfolio_cummulation
---     (loan_repaid = 1, tbl_dt = 20260331).
---     Assumption: days from disbursement to repayment > 30 is
---     treated as a late repayment (same 30-day term assumption).
---     Cooling-off window = 90 days from repayment date.
---     Update tbl_dt to 20260430 when that snapshot is available.
+--     Source: wamujap.fm_momo_loan_portfolio_cummulation (loan_repaid=1).
+--     Late repayment proxy: days from disbursement to repayment > 30.
+--     30-day loan term confirmed as default. Cooling-off = 90 days.
+--     Update loan_snapshot_tbl_dt in params to 20260430 when available.
 -- ============================================================
 
 CREATE OR REPLACE VIEW vw_loan_eligibility_waterfall AS
 
+-- ── Analysis window parameters ────────────────────────────────
+-- TO CHANGE THE ANALYSIS WINDOW: edit the four values below only.
+-- window_90d_start: lower bound for Rules 3 & 4 transaction/value window.
+-- Currently equals window_30d_start (30-day proxy — April 2026 data only).
+-- Change window_90d_start to DATE '2026-02-01' when 90-day history is loaded.
+WITH params AS (
+    SELECT
+        DATE '2026-04-30'  AS analysis_end_date,
+        DATE '2026-04-01'  AS window_30d_start,
+        DATE '2026-04-01'  AS window_90d_start,
+        20260331           AS loan_snapshot_tbl_dt
+),
+
+-- ── Rule 1: subscriber registration / activation dates ────────
+-- Source: devdata.account_holder_dump (MOBILE MONEY, ACTIVE accounts only).
+-- registration_date and activation_date are VARCHAR YYYYMMDD (e.g. '20260401').
+subscriber_reg AS (
+    SELECT
+        msisdn,
+        TRY(date_parse(registration_date, '%Y%m%d'))  AS registration_date,
+        TRY(date_parse(activation_date,   '%Y%m%d'))  AS activation_date,
+        COALESCE(
+            TRY(date_parse(registration_date, '%Y%m%d')),
+            TRY(date_parse(activation_date,   '%Y%m%d'))
+        )                                              AS derived_reg_date
+    FROM devdata.account_holder_dump
+    WHERE account_type   = 'MOBILE MONEY'
+      AND account_status = 'ACTIVE'
+      AND msisdn        != ''
+),
+
 -- ── Base: all subscribers seen in the event stream ───────────
-WITH subscriber_base AS (
+subscriber_base AS (
     SELECT
         subscriber_msisdn,
         MIN(event_dt)            AS first_activity_dt,
@@ -55,25 +85,28 @@ WITH subscriber_base AS (
 -- ── Rule 2: MAU30 — any MoMo event in the last 30 days ───────
 mau30_activity AS (
     SELECT
-        subscriber_msisdn,
-        COUNT(DISTINCT event_dt)                                      AS active_days_last30d,
-        CASE WHEN COUNT(DISTINCT event_dt) >= 1 THEN 1 ELSE 0 END    AS mau30_flag
-    FROM vw1_credit_v1_normalized_events
-    WHERE event_dt >= date_add('day', -29, DATE '2026-04-30')
-    GROUP BY subscriber_msisdn
+        v.subscriber_msisdn,
+        COUNT(DISTINCT v.event_dt)                                      AS active_days_last30d,
+        CASE WHEN COUNT(DISTINCT v.event_dt) >= 1 THEN 1 ELSE 0 END    AS mau30_flag
+    FROM vw1_credit_v1_normalized_events v
+    CROSS JOIN params p
+    WHERE v.event_dt BETWEEN p.window_30d_start AND p.analysis_end_date
+    GROUP BY v.subscriber_msisdn
 ),
 
 -- ── Rules 3 & 4: wallet transaction count and value ──────────
--- Grain: one row per subscriber across the full available window.
--- NOTE: covers 30 days (April 2026), not the required 90 days.
+-- Window controlled by params.window_90d_start → params.analysis_end_date.
+-- Change window_90d_start to DATE '2026-02-01' for a proper 90-day lookback.
 momo_activity AS (
     SELECT
-        subscriber_msisdn,
-        COUNT_IF(event_family IN ('wallet_inflow', 'wallet_outflow'))          AS momo_txn_cnt_30d,
-        SUM(CASE WHEN event_family = 'wallet_inflow'  THEN txn_value_num ELSE 0.0 END) AS momo_inflow_30d,
-        SUM(CASE WHEN event_family = 'wallet_outflow' THEN txn_value_num ELSE 0.0 END) AS momo_outflow_30d
-    FROM vw1_credit_v1_normalized_events
-    GROUP BY subscriber_msisdn
+        v.subscriber_msisdn,
+        COUNT_IF(v.event_family IN ('wallet_inflow', 'wallet_outflow'))                    AS momo_txn_cnt_30d,
+        SUM(CASE WHEN v.event_family = 'wallet_inflow'  THEN v.txn_value_num ELSE 0.0 END) AS momo_inflow_30d,
+        SUM(CASE WHEN v.event_family = 'wallet_outflow' THEN v.txn_value_num ELSE 0.0 END) AS momo_outflow_30d
+    FROM vw1_credit_v1_normalized_events v
+    CROSS JOIN params p
+    WHERE v.event_dt BETWEEN p.window_90d_start AND p.analysis_end_date
+    GROUP BY v.subscriber_msisdn
 ),
 
 -- ── Layer 1: most-recent 30-day feature snapshot per subscriber
@@ -111,27 +144,27 @@ layer1_latest AS (
 ),
 
 -- ── Rule 5: overdue loans (active, unrepaid, > 60 days old) ──
--- Grain: one row per msisdn with any overdue loan.
--- Source: fm_momo_loan_portfolio_cummulation snapshot 20260331.
--- Update tbl_dt to 20260430 when that snapshot is available.
+-- Snapshot date = params.analysis_end_date (not the tbl_dt snapshot date).
+-- Update loan_snapshot_tbl_dt in params to 20260430 when available.
 loan_overdue_signals AS (
     SELECT
         msisdn,
-        COUNT(DISTINCT loan_id)                                       AS overdue_loan_count,
-        SUM(outstanding_loan)                                         AS total_overdue_amount,
-        MAX(date_diff('day', disbursement_date, snapshot_date))       AS max_days_outstanding,
-        1                                                             AS overdue_60d_flag
+        COUNT(DISTINCT loan_id)                                        AS overdue_loan_count,
+        SUM(outstanding_loan)                                          AS total_overdue_amount,
+        MAX(date_diff('day', disbursement_date, snapshot_date))        AS max_days_outstanding,
+        1                                                              AS overdue_60d_flag
     FROM (
         SELECT
-            msisdn,
-            loan_id,
-            outstanding_loan,
-            CAST(date_parse(CAST(disbursement_date AS VARCHAR), '%Y%m%d') AS DATE) AS disbursement_date,
-            CAST(date_parse(CAST(tbl_dt            AS VARCHAR), '%Y%m%d') AS DATE) AS snapshot_date
-        FROM wamujap.fm_momo_loan_portfolio_cummulation
-        WHERE tbl_dt              = 20260331   -- update to 20260430 when available
-          AND loan_repaid         = 0          -- active / unrepaid loans only
-          AND disbursement_date   IS NOT NULL
+            lp.msisdn,
+            lp.loan_id,
+            lp.outstanding_loan,
+            CAST(date_parse(CAST(lp.disbursement_date AS VARCHAR), '%Y%m%d') AS DATE) AS disbursement_date,
+            p.analysis_end_date                                                         AS snapshot_date
+        FROM wamujap.fm_momo_loan_portfolio_cummulation lp
+        CROSS JOIN params p
+        WHERE lp.tbl_dt          = p.loan_snapshot_tbl_dt
+          AND lp.loan_repaid     = 0
+          AND lp.disbursement_date IS NOT NULL
     ) t
     WHERE outstanding_loan > 0
       AND date_diff('day', disbursement_date, snapshot_date) > 60
@@ -139,36 +172,35 @@ loan_overdue_signals AS (
 ),
 
 -- ── Rule 6: cooling-off after late repayment ──────────────────
--- Grain: one row per msisdn currently inside a cooling-off window.
--- Source: fm_momo_loan_portfolio_cummulation snapshot 20260331.
--- Assumption: loan term = 30 days. "Late" = days_to_repay > 30.
--- Cooling-off = 90 days from repayment date.
--- Update tbl_dt to 20260430 when that snapshot is available.
+-- Loan term = 30 days (confirmed default — no due_date in source table).
+-- "Late" = days from disbursement to repayment > 30. Cooling-off = 90 days.
+-- Update loan_snapshot_tbl_dt in params to 20260430 when available.
 loan_cooling_off_signals AS (
     SELECT
         msisdn,
-        COUNT(DISTINCT loan_id)                            AS cooling_off_loan_count,
-        MAX(repayment_date)                                AS latest_late_repayment_date,
-        MAX(date_add('day', 90, repayment_date))           AS latest_cooling_off_end_date,
-        SUM(loan_disbursed)                                AS cooling_off_affected_loan_value,
-        1                                                  AS cooling_off_flag
+        COUNT(DISTINCT loan_id)                           AS cooling_off_loan_count,
+        MAX(repayment_date)                               AS latest_late_repayment_date,
+        MAX(date_add('day', 90, repayment_date))          AS latest_cooling_off_end_date,
+        SUM(loan_disbursed)                               AS cooling_off_affected_loan_value,
+        1                                                 AS cooling_off_flag
     FROM (
         SELECT
-            msisdn,
-            loan_id,
-            loan_disbursed,
-            CAST(date_parse(CAST(disbursement_date AS VARCHAR), '%Y%m%d') AS DATE) AS disbursement_date,
-            CAST(date_parse(CAST(repayment_date    AS VARCHAR), '%Y%m%d') AS DATE) AS repayment_date,
-            CAST(date_parse(CAST(tbl_dt            AS VARCHAR), '%Y%m%d') AS DATE) AS snapshot_date
-        FROM wamujap.fm_momo_loan_portfolio_cummulation
-        WHERE tbl_dt            = 20260331   -- update to 20260430 when available
-          AND loan_repaid       = 1          -- closed / repaid loans only
-          AND repayment_date    IS NOT NULL
-          AND disbursement_date IS NOT NULL
+            lp.msisdn,
+            lp.loan_id,
+            lp.loan_disbursed,
+            CAST(date_parse(CAST(lp.disbursement_date AS VARCHAR), '%Y%m%d') AS DATE) AS disbursement_date,
+            CAST(date_parse(CAST(lp.repayment_date    AS VARCHAR), '%Y%m%d') AS DATE) AS repayment_date,
+            p.analysis_end_date                                                         AS snapshot_date
+        FROM wamujap.fm_momo_loan_portfolio_cummulation lp
+        CROSS JOIN params p
+        WHERE lp.tbl_dt            = p.loan_snapshot_tbl_dt
+          AND lp.loan_repaid       = 1
+          AND lp.repayment_date    IS NOT NULL
+          AND lp.disbursement_date IS NOT NULL
     ) t
-    WHERE date_diff('day', disbursement_date, repayment_date) > 30   -- late repayment proxy
+    WHERE date_diff('day', disbursement_date, repayment_date) > 30
       AND snapshot_date BETWEEN repayment_date
-                            AND date_add('day', 90, repayment_date)  -- inside cooling window
+                            AND date_add('day', 90, repayment_date)
     GROUP BY msisdn
 ),
 
@@ -180,41 +212,47 @@ eligibility_base AS (
         sb.last_activity_dt,
         sb.total_active_days,
 
-        -- -------------------------------------------------------
+        -- Rule 1 diagnostic columns (from devdata.account_holder_dump)
+        sr.derived_reg_date,
+        sr.registration_date                            AS reg_registration_date,
+        sr.activation_date                              AS reg_activation_date,
+        date_diff('day',
+            COALESCE(sr.derived_reg_date, sb.first_activity_dt),
+            p.analysis_end_date
+        )                                               AS momo_age_days,
+
         -- Rule 1: MoMo age >= 180 days
-        -- PRODUCTION: replace CAST(1 …) with a join to the
-        -- subscriber registry, e.g.:
-        --   LEFT JOIN subscriber_registry sr
-        --       ON sb.subscriber_msisdn = sr.msisdn
-        -- and use:
-        --   CASE WHEN date_diff('day', sr.registration_dt,
-        --                       DATE '2026-04-30') >= 180
-        --        THEN 1 ELSE 0 END
-        -- -------------------------------------------------------
-        CAST(1 AS INTEGER)                                      AS rule1_momo_age_180d_flag,
+        -- Priority: registration_date → activation_date → first_activity_dt (vw1 fallback)
+        CASE
+            WHEN date_diff('day',
+                     COALESCE(sr.derived_reg_date, sb.first_activity_dt),
+                     p.analysis_end_date
+                 ) >= 180
+            THEN 1 ELSE 0
+        END                                             AS rule1_momo_age_180d_flag,
 
         -- Rule 2: MAU30 — active in last 30 days
-        COALESCE(m30.mau30_flag, 0)                            AS rule2_mau30_flag,
-        COALESCE(m30.active_days_last30d, 0)                   AS active_days_last30d,
+        COALESCE(m30.mau30_flag, 0)                    AS rule2_mau30_flag,
+        COALESCE(m30.active_days_last30d, 0)           AS active_days_last30d,
 
-        -- Rule 3: >= 5 MoMo transactions in 90 days (30-day proxy)
+        -- Rule 3: >= 5 MoMo transactions in 90 days (30-day proxy currently)
         CASE WHEN COALESCE(ma.momo_txn_cnt_30d, 0) >= 5
-             THEN 1 ELSE 0 END                                 AS rule3_min_5txn_flag,
-        COALESCE(ma.momo_txn_cnt_30d, 0)                      AS momo_txn_cnt_30d,
+             THEN 1 ELSE 0 END                         AS rule3_min_5txn_flag,
+        COALESCE(ma.momo_txn_cnt_30d, 0)              AS momo_txn_cnt_30d,
 
-        -- Rule 4: >= UGX 10,000 inflow or outflow in 90 days (30-day proxy)
+        -- Rule 4: >= UGX 10,000 inflow or outflow in 90 days (30-day proxy currently)
         CASE WHEN   COALESCE(ma.momo_inflow_30d,  0) >= 10000
                OR   COALESCE(ma.momo_outflow_30d, 0) >= 10000
-             THEN 1 ELSE 0 END                                 AS rule4_min_10k_value_flag,
-        COALESCE(ma.momo_inflow_30d,  0)                      AS momo_inflow_30d,
-        COALESCE(ma.momo_outflow_30d, 0)                      AS momo_outflow_30d,
+             THEN 1 ELSE 0 END                         AS rule4_min_10k_value_flag,
+        COALESCE(ma.momo_inflow_30d,  0)              AS momo_inflow_30d,
+        COALESCE(ma.momo_outflow_30d, 0)              AS momo_outflow_30d,
 
         -- Rule 5: No active term loan overdue > 60 days
-        -- Source: loan_overdue_signals (fm_momo_loan_portfolio_cummulation)
+        -- Source: loan_overdue_signals (fm_momo_loan_portfolio_cummulation, loan_repaid=0)
         CASE WHEN lov.overdue_60d_flag = 1 THEN 0 ELSE 1 END  AS rule5_no_overdue_60d_flag,
 
         -- Rule 6: Not in cooling-off period
-        -- Source: loan_cooling_off_signals (fm_momo_loan_portfolio_cummulation)
+        -- Source: loan_cooling_off_signals (fm_momo_loan_portfolio_cummulation, loan_repaid=1)
         CASE WHEN lco.cooling_off_flag = 1 THEN 0 ELSE 1 END  AS rule6_no_cooling_off_flag,
 
         -- ── Financial features (from vw3) ──────────────────────
@@ -247,11 +285,13 @@ eligibility_base AS (
         lco.latest_cooling_off_end_date
 
     FROM subscriber_base sb
-    LEFT JOIN mau30_activity           m30 ON sb.subscriber_msisdn = m30.subscriber_msisdn
-    LEFT JOIN momo_activity             ma ON sb.subscriber_msisdn = ma.subscriber_msisdn
-    LEFT JOIN layer1_latest             l1 ON sb.subscriber_msisdn = l1.subscriber_msisdn
-    LEFT JOIN loan_overdue_signals     lov ON sb.subscriber_msisdn = lov.msisdn
-    LEFT JOIN loan_cooling_off_signals lco ON sb.subscriber_msisdn = lco.msisdn
+    CROSS JOIN params p
+    LEFT JOIN subscriber_reg             sr  ON sb.subscriber_msisdn = sr.msisdn
+    LEFT JOIN mau30_activity             m30 ON sb.subscriber_msisdn = m30.subscriber_msisdn
+    LEFT JOIN momo_activity               ma ON sb.subscriber_msisdn = ma.subscriber_msisdn
+    LEFT JOIN layer1_latest               l1 ON sb.subscriber_msisdn = l1.subscriber_msisdn
+    LEFT JOIN loan_overdue_signals       lov ON sb.subscriber_msisdn = lov.msisdn
+    LEFT JOIN loan_cooling_off_signals   lco ON sb.subscriber_msisdn = lco.msisdn
 ),
 
 -- ── Waterfall: cumulative eligibility after each rule ─────────
@@ -309,6 +349,11 @@ SELECT
     first_activity_dt,
     last_activity_dt,
     total_active_days,
+    -- Rule 1 registration diagnostics
+    derived_reg_date,
+    reg_registration_date,
+    reg_activation_date,
+    momo_age_days,
     -- Rule flags
     rule1_momo_age_180d_flag,
     rule2_mau30_flag,
