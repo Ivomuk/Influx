@@ -1,13 +1,17 @@
 import logging
+import re
 import warnings
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
 
-# Views requiring materialisation: produce DataFrames consumed by the decision engine.
-# vw1 and vw2 stay as lazy Presto views — Presto evaluates them inline as part of
-# the vw3/vw4 materialisation query plan.
+# All 6 views are materialised into same-named Hive tables.
+# Environments that do not support CREATE VIEW use these tables in place of
+# lazy Presto views; the dependency chain (vw3 references vw2, etc.) is
+# preserved because the table names match the former view names.
 _MATERIALISE = {
+    'vw1_credit_v1_normalized_events',
+    'vw2_credit_v1_subscriber_day',
     'vw3_credit_v1_layer1_features',
     'vw4_credit_v1_layer0_scores',
     'vw5_credit_v1_reason_codes',
@@ -23,12 +27,22 @@ _DATE_COL = {
     'vw6_credit_v1_cap_and_action':    'feature_dt',
 }
 
+# Target table name == view name (identity mapping).
+# Tables are pre-created by deployment/pipeline_view_tables.sql.
 _MAT_SUFFIX = {
-    'vw3_credit_v1_layer1_features': 'mat_vw3_layer1_features',
-    'vw4_credit_v1_layer0_scores':   'mat_vw4_layer0_scores',
-    'vw5_credit_v1_reason_codes':    'mat_vw5_reason_codes',
-    'vw6_credit_v1_cap_and_action':  'mat_vw6_cap_and_action',
+    'vw1_credit_v1_normalized_events': 'vw1_credit_v1_normalized_events',
+    'vw2_credit_v1_subscriber_day':    'vw2_credit_v1_subscriber_day',
+    'vw3_credit_v1_layer1_features':   'vw3_credit_v1_layer1_features',
+    'vw4_credit_v1_layer0_scores':     'vw4_credit_v1_layer0_scores',
+    'vw5_credit_v1_reason_codes':      'vw5_credit_v1_reason_codes',
+    'vw6_credit_v1_cap_and_action':    'vw6_credit_v1_cap_and_action',
 }
+
+
+def _extract_select(view_sql: str) -> str:
+    """Return the SELECT body from a CREATE OR REPLACE VIEW ... AS <select> file."""
+    match = re.search(r'(?i)CREATE\s+OR\s+REPLACE\s+VIEW\s+\S+\s+AS\s*\n', view_sql)
+    return view_sql[match.end():].strip() if match else view_sql.strip()
 
 
 class PrestoSQLBatchEngine:
@@ -57,15 +71,10 @@ class PrestoSQLBatchEngine:
         sql_file = self._sql_dir / f'{view_name}.sql'
         view_sql = sql_file.read_text()
 
-        if view_name not in _MATERIALISE:
-            _log.info('Refreshing Presto view: %s', view_name)
-            self._qc.execute(view_sql)
-            return
-
-        mat_table   = _MAT_SUFFIX[view_name]
-        date_col    = _DATE_COL[view_name]
-        fq_mat      = f'hive.credit_engine.{mat_table}'
-        fq_view     = f'hive.credit_engine.{view_name}'
+        mat_table    = _MAT_SUFFIX[view_name]
+        date_col     = _DATE_COL[view_name]
+        fq_table     = f'hive.credit_engine.{mat_table}'
+        select_sql   = _extract_select(view_sql)
         table_exists = self._table_exists(mat_table)
 
         for attempt in range(max_retries):
@@ -73,10 +82,10 @@ class PrestoSQLBatchEngine:
                 if not table_exists:
                     _log.info('CTAS materialise %s for %s', view_name, execution_date)
                     self._qc.execute(
-                        f"CREATE TABLE {fq_mat} "
+                        f"CREATE TABLE {fq_table} "
                         f"WITH (format = 'PARQUET', partitioned_by = ARRAY['run_date']) AS "
                         f"SELECT t.*, '{execution_date}' AS run_date "
-                        f"FROM {fq_view} t "
+                        f"FROM (\n{select_sql}\n) t "
                         f"WHERE t.{date_col} = DATE '{execution_date}'"
                     )
                 else:
@@ -86,9 +95,9 @@ class PrestoSQLBatchEngine:
                     )
                     try:
                         self._qc.execute(
-                            f"INSERT INTO {fq_mat} "
+                            f"INSERT INTO {fq_table} "
                             f"SELECT t.*, '{execution_date}' AS run_date "
-                            f"FROM {fq_view} t "
+                            f"FROM (\n{select_sql}\n) t "
                             f"WHERE t.{date_col} = DATE '{execution_date}'"
                         )
                     finally:

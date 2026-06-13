@@ -37,24 +37,32 @@ def _write_sql(sql_dir, view_name, content='CREATE OR REPLACE VIEW placeholder A
 # Tests
 # ---------------------------------------------------------------------------
 
-def test_run_vw1_executes_create_view(tmp_path):
-    sql_content = 'CREATE OR REPLACE VIEW hive.credit_engine.vw1 AS SELECT 1'
+def test_run_vw1_materialises_into_same_named_table(tmp_path):
+    sql_content = 'CREATE OR REPLACE VIEW hive.credit_engine.vw1 AS SELECT 1 AS x'
     _write_sql(tmp_path, 'vw1_credit_v1_normalized_events', sql_content)
-    engine, qc = _make_engine(tmp_path)
+    engine, qc = _make_engine(tmp_path, table_exists=False)
 
     engine.run('vw1_credit_v1_normalized_events', '2025-01-15')
 
-    qc.execute.assert_called_once_with(sql_content)
+    executed_sql = qc.execute.call_args[0][0]
+    assert 'CREATE TABLE hive.credit_engine.vw1_credit_v1_normalized_events' in executed_sql
+    assert "'2025-01-15' AS run_date" in executed_sql
+    assert "WHERE t.event_dt = DATE '2025-01-15'" in executed_sql
+    assert 'SELECT 1 AS x' in executed_sql
 
 
-def test_run_vw2_executes_create_view(tmp_path):
-    sql_content = 'CREATE OR REPLACE VIEW hive.credit_engine.vw2 AS SELECT 1'
+def test_run_vw2_materialises_into_same_named_table(tmp_path):
+    sql_content = 'CREATE OR REPLACE VIEW hive.credit_engine.vw2 AS SELECT 2 AS y'
     _write_sql(tmp_path, 'vw2_credit_v1_subscriber_day', sql_content)
-    engine, qc = _make_engine(tmp_path)
+    engine, qc = _make_engine(tmp_path, table_exists=False)
 
     engine.run('vw2_credit_v1_subscriber_day', '2025-01-15')
 
-    qc.execute.assert_called_once_with(sql_content)
+    executed_sql = qc.execute.call_args[0][0]
+    assert 'CREATE TABLE hive.credit_engine.vw2_credit_v1_subscriber_day' in executed_sql
+    assert "'2025-01-15' AS run_date" in executed_sql
+    assert "WHERE t.event_dt = DATE '2025-01-15'" in executed_sql
+    assert 'SELECT 2 AS y' in executed_sql
 
 
 def test_run_vw3_ctas_when_table_absent(tmp_path):
@@ -64,7 +72,7 @@ def test_run_vw3_ctas_when_table_absent(tmp_path):
     engine.run('vw3_credit_v1_layer1_features', '2025-01-15')
 
     executed_sql = qc.execute.call_args[0][0]
-    assert 'CREATE TABLE hive.credit_engine.mat_vw3_layer1_features' in executed_sql
+    assert 'CREATE TABLE hive.credit_engine.vw3_credit_v1_layer1_features' in executed_sql
     assert "WITH (format = 'PARQUET'" in executed_sql
     assert "'2025-01-15' AS run_date" in executed_sql
     assert "WHERE t.feature_dt = DATE '2025-01-15'" in executed_sql
@@ -84,7 +92,7 @@ def test_run_vw3_insert_overwrite_when_table_exists(tmp_path):
     insert_sql = next((s for s in calls if s.startswith('INSERT INTO')), None)
     assert overwrite_set is not None, 'Expected SET SESSION OVERWRITE call'
     assert insert_sql is not None, 'Expected INSERT INTO call'
-    assert 'mat_vw3_layer1_features' in insert_sql
+    assert 'vw3_credit_v1_layer1_features' in insert_sql
     assert "WHERE t.feature_dt = DATE '2025-01-15'" in insert_sql
 
 
@@ -125,7 +133,7 @@ def test_read_queries_mat_table_with_correct_date(tmp_path):
     result = engine.read('vw3_credit_v1_layer1_features', '2025-01-15')
 
     query_sql = qc.query.call_args[0][0]
-    assert 'mat_vw3_layer1_features' in query_sql
+    assert 'vw3_credit_v1_layer1_features' in query_sql
     assert "run_date = '2025-01-15'" in query_sql
     pd.testing.assert_frame_equal(result, expected_df)
 
