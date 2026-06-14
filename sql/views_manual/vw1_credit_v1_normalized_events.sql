@@ -29,7 +29,7 @@ FROM (
             from_sp,
             to_sp
         FROM analytics.momo_tran_loc_mapping_v2
-        WHERE date_key BETWEEN 20260401 AND 20260430
+        WHERE CAST(date_key AS VARCHAR) BETWEEN '20260401' AND '20260430'
           AND NOT (
                 (service_name = 'Xtrafloat'               AND sub_service_name = 'Fee (Xtrafloat)')
              OR (service_name = 'Clinic Pesa'              AND sub_service_name = 'Revenue Share (Clinic Pesa)')
