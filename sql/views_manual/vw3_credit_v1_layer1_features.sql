@@ -269,6 +269,7 @@ FROM (
             w30.wallet_inflow_amt_30d,
             w30.wallet_outflow_amt_30d,
             w30.spend_amt_30d,
+            w30.savings_amt_30d,
             w30.disbursement_cnt_30d,
             w30.repayment_cnt_30d,
             w30.wallet_txn_cnt_30d,
