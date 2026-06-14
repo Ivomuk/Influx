@@ -10,11 +10,33 @@ SET SESSION hive.insert_existing_partitions_behavior = 'OVERWRITE';
 INSERT INTO hive.credit_engine.vw3_credit_v1_layer1_features
 SELECT t.*, 'YYYY-MM-DD' AS run_date
 FROM (
-    WITH anchor_days AS (
+    -- Cast event_dt to DATE once here; Presto/Hive may return DATE columns as
+    -- BIGINT (days since epoch) when reading from a Hive table.
+    WITH vw2_data AS (
+        SELECT
+            CAST(event_dt AS DATE)  AS event_dt,
+            subscriber_msisdn,
+            loan_disb_amt_day,
+            loan_repaid_amt_day,
+            wallet_inflow_amt_day,
+            wallet_outflow_amt_day,
+            spend_amt_day,
+            savings_amt_day,
+            loan_disb_cnt_day,
+            loan_repay_cnt_day,
+            wallet_txn_cnt_day,
+            lender_family_cnt_day,
+            had_disbursement_day,
+            had_repayment_day,
+            alt_credit_signal_flag_day
+        FROM vw2_credit_v1_subscriber_day
+    ),
+
+    anchor_days AS (
         SELECT DISTINCT
             event_dt AS feature_dt,
             subscriber_msisdn
-        FROM vw2_credit_v1_subscriber_day
+        FROM vw2_data
     ),
 
     -- -----------------------------------------------------------------------
@@ -36,7 +58,7 @@ FROM (
             COUNT(DISTINCT CASE WHEN b.wallet_txn_cnt_day > 0 THEN b.event_dt END) AS wallet_active_days_90d,
             MIN(b.event_dt)               AS earliest_observed_dt
         FROM anchor_days a
-        INNER JOIN vw2_credit_v1_subscriber_day b
+        INNER JOIN vw2_data b
             ON  a.subscriber_msisdn = b.subscriber_msisdn
             AND b.event_dt BETWEEN date_add('day', -89, a.feature_dt) AND a.feature_dt
         GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -58,7 +80,7 @@ FROM (
             SUM(b.loan_repay_cnt_day)     AS repayment_cnt_60d,
             COUNT(DISTINCT CASE WHEN b.wallet_txn_cnt_day > 0 THEN b.event_dt END) AS wallet_active_days_60d
         FROM anchor_days a
-        INNER JOIN vw2_credit_v1_subscriber_day b
+        INNER JOIN vw2_data b
             ON  a.subscriber_msisdn = b.subscriber_msisdn
             AND b.event_dt BETWEEN date_add('day', -59, a.feature_dt) AND a.feature_dt
         GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -87,7 +109,7 @@ FROM (
             MAX(CASE WHEN b.had_repayment_day    = 1 THEN b.event_dt END) AS last_repayment_dt,
             COUNT(DISTINCT CASE WHEN b.wallet_txn_cnt_day > 0 THEN b.event_dt END) AS wallet_active_days_30d
         FROM anchor_days a
-        INNER JOIN vw2_credit_v1_subscriber_day b
+        INNER JOIN vw2_data b
             ON  a.subscriber_msisdn = b.subscriber_msisdn
             AND b.event_dt BETWEEN date_add('day', -29, a.feature_dt) AND a.feature_dt
         GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -109,7 +131,7 @@ FROM (
             SUM(b.loan_repay_cnt_day)     AS repayment_cnt_14d,
             COUNT(DISTINCT CASE WHEN b.wallet_txn_cnt_day > 0 THEN b.event_dt END) AS wallet_active_days_14d
         FROM anchor_days a
-        INNER JOIN vw2_credit_v1_subscriber_day b
+        INNER JOIN vw2_data b
             ON  a.subscriber_msisdn = b.subscriber_msisdn
             AND b.event_dt BETWEEN date_add('day', -13, a.feature_dt) AND a.feature_dt
         GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -131,7 +153,7 @@ FROM (
             SUM(b.loan_repay_cnt_day)     AS repayment_cnt_7d,
             COUNT(DISTINCT CASE WHEN b.wallet_txn_cnt_day > 0 THEN b.event_dt END) AS wallet_active_days_7d
         FROM anchor_days a
-        INNER JOIN vw2_credit_v1_subscriber_day b
+        INNER JOIN vw2_data b
             ON  a.subscriber_msisdn = b.subscriber_msisdn
             AND b.event_dt BETWEEN date_add('day', -6, a.feature_dt) AND a.feature_dt
         GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -155,7 +177,7 @@ FROM (
                 ELSE 0.0
             END) AS wallet_activity_prev_7d
         FROM anchor_days a
-        INNER JOIN vw2_credit_v1_subscriber_day b
+        INNER JOIN vw2_data b
             ON  a.subscriber_msisdn = b.subscriber_msisdn
             AND b.event_dt BETWEEN date_add('day', -13, a.feature_dt) AND a.feature_dt
         GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -175,7 +197,7 @@ FROM (
             END) AS inflow_last_2d,
             SUM(b.wallet_inflow_amt_day) / NULLIF(COUNT(b.event_dt), 0) AS avg_daily_inflow_30d
         FROM anchor_days a
-        INNER JOIN vw2_credit_v1_subscriber_day b
+        INNER JOIN vw2_data b
             ON  a.subscriber_msisdn = b.subscriber_msisdn
             AND b.event_dt BETWEEN date_add('day', -29, a.feature_dt) AND a.feature_dt
         GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -210,7 +232,7 @@ FROM (
                 ELSE NULL
             END AS repayment_ratio_prev_7d
         FROM anchor_days a
-        INNER JOIN vw2_credit_v1_subscriber_day b
+        INNER JOIN vw2_data b
             ON  a.subscriber_msisdn = b.subscriber_msisdn
             AND b.event_dt BETWEEN date_add('day', -13, a.feature_dt) AND a.feature_dt
         GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -230,7 +252,7 @@ FROM (
             END) AS same_day_disb_repay_flag,
             COUNT(CASE WHEN b.had_disbursement_day = 1 THEN 1 END) AS disb_days_7d
         FROM anchor_days a
-        INNER JOIN vw2_credit_v1_subscriber_day b
+        INNER JOIN vw2_data b
             ON  a.subscriber_msisdn = b.subscriber_msisdn
             AND b.event_dt BETWEEN date_add('day', -6, a.feature_dt) AND a.feature_dt
         GROUP BY a.feature_dt, a.subscriber_msisdn
