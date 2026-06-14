@@ -7,7 +7,40 @@ SET SESSION hive.insert_existing_partitions_behavior = 'OVERWRITE';
 INSERT INTO hive.credit_engine.vw6_credit_v1_cap_and_action
 SELECT t.*, 'YYYY-MM-DD' AS run_date
 FROM (
-    WITH base AS (
+    -- Cast feature_dt to DATE in all source tables; Presto/Hive returns DATE
+    -- columns from Hive tables as BIGINT (days since epoch).
+    WITH vw3_data AS (
+        SELECT
+            CAST(feature_dt AS DATE) AS feature_dt,
+            subscriber_msisdn,
+            outstanding_exposure_amt,
+            wallet_inflow_amt_30d,
+            repayment_ratio_30d,
+            days_since_last_disbursement,
+            disbursement_cnt_30d
+        FROM vw3_credit_v1_layer1_features
+    ),
+
+    vw4_data AS (
+        SELECT
+            CAST(feature_dt AS DATE) AS feature_dt,
+            subscriber_msisdn,
+            expected_repayment_probability_v1_rule,
+            expected_credit_loss_rate_v1_rule,
+            churn_cooling_probability_v1_rule,
+            debt_stress_index_v1
+        FROM vw4_credit_v1_layer0_scores
+    ),
+
+    vw5_data AS (
+        SELECT
+            CAST(feature_dt AS DATE) AS feature_dt,
+            subscriber_msisdn,
+            primary_reason_code
+        FROM vw5_credit_v1_reason_codes
+    ),
+
+    base AS (
         SELECT
             r.feature_dt,
             r.subscriber_msisdn,
@@ -21,11 +54,11 @@ FROM (
             l0.expected_credit_loss_rate_v1_rule,
             l0.churn_cooling_probability_v1_rule,
             l0.debt_stress_index_v1
-        FROM vw5_credit_v1_reason_codes r
-        INNER JOIN vw3_credit_v1_layer1_features l1
+        FROM vw5_data r
+        INNER JOIN vw3_data l1
             ON r.feature_dt = l1.feature_dt
            AND r.subscriber_msisdn = l1.subscriber_msisdn
-        INNER JOIN vw4_credit_v1_layer0_scores l0
+        INNER JOIN vw4_data l0
             ON r.feature_dt = l0.feature_dt
            AND r.subscriber_msisdn = l0.subscriber_msisdn
     ),
