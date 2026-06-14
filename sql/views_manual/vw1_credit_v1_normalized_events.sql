@@ -17,17 +17,17 @@ FROM (
         SELECT
             CAST(date_parse(CAST(date_key AS varchar), '%Y%m%d') AS date) AS event_dt,
             inserted_dt,
-            fid,
-            service_name,
-            sub_service_name,
-            instruct_hdr_type,
-            from_msisdn,
-            to_msisdn,
+            CAST(fid AS VARCHAR)           AS fid,
+            CAST(service_name AS VARCHAR)  AS service_name,
+            CAST(sub_service_name AS VARCHAR) AS sub_service_name,
+            CAST(instruct_hdr_type AS VARCHAR) AS instruct_hdr_type,
+            CAST(from_msisdn AS VARCHAR)   AS from_msisdn,
+            CAST(to_msisdn AS VARCHAR)     AS to_msisdn,
             CAST(replace(CAST(txn_value AS varchar), ',', '') AS double) AS txn_value_num,
-            from_profile,
-            to_profile,
-            from_sp,
-            to_sp
+            CAST(from_profile AS VARCHAR)  AS from_profile,
+            CAST(to_profile AS VARCHAR)    AS to_profile,
+            CAST(from_sp AS VARCHAR)       AS from_sp,
+            CAST(to_sp AS VARCHAR)         AS to_sp
         FROM analytics.momo_tran_loc_mapping_v2
         WHERE CAST(date_key AS VARCHAR) BETWEEN '20260401' AND '20260430'
           AND NOT (
