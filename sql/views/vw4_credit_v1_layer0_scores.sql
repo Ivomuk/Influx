@@ -4,7 +4,51 @@
 -- All score names retain the _v1_rule suffix for continuity with downstream consumers.
 
 CREATE OR REPLACE VIEW vw4_credit_v1_layer0_scores AS
-WITH base_metrics AS (
+-- Cast feature_dt to DATE once; Presto/Hive returns DATE columns from Hive
+-- tables as BIGINT (days since epoch).
+WITH vw3_data AS (
+    SELECT
+        CAST(feature_dt AS DATE) AS feature_dt,
+        subscriber_msisdn,
+        outstanding_exposure_amt,
+        active_lender_cnt_30d,
+        disbursement_cnt_30d,
+        days_since_last_disbursement,
+        repayment_ratio_30d,
+        repayment_cnt_30d,
+        days_since_last_repayment,
+        repayment_ratio_14d,
+        repayment_ratio_60d,
+        repayment_ratio_90d,
+        repayment_ratio_trend_7d,
+        wallet_inflow_amt_30d,
+        wallet_inflow_amt_90d,
+        wallet_outflow_amt_30d,
+        spend_amt_30d,
+        wallet_txn_cnt_30d,
+        wallet_active_days_30d,
+        wallet_active_days_7d,
+        wallet_active_days_14d,
+        wallet_active_days_90d,
+        wallet_inflow_trend_7d_vs_90d,
+        post_loan_wallet_activity_change_ratio,
+        stacked_borrowing_flag_30d,
+        repeated_borrowing_flag_30d,
+        alt_credit_active_flag_30d,
+        active_lender_days_30d,
+        loan_disb_amt_30d,
+        loan_repaid_amt_30d,
+        timing_manipulation_flag,
+        suspicious_repayment_jump_flag,
+        loan_cycling_flag,
+        sim_age_days,
+        sim_age_cohort,
+        has_inflow_and_spend_flag,
+        identity_confidence_score_v2
+    FROM vw3_credit_v1_layer1_features
+),
+
+base_metrics AS (
     SELECT
         feature_dt,
         subscriber_msisdn,
@@ -26,6 +70,7 @@ WITH base_metrics AS (
 
         -- Wallet activity
         wallet_inflow_amt_30d,
+        wallet_inflow_amt_90d,
         wallet_outflow_amt_30d,
         spend_amt_30d,
         wallet_txn_cnt_30d,
@@ -63,7 +108,7 @@ WITH base_metrics AS (
             ELSE NULL
         END AS exposure_to_inflow_ratio
 
-    FROM vw3_credit_v1_layer1_features
+    FROM vw3_data
 ),
 
 first_level_scores AS (

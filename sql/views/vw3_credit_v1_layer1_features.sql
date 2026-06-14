@@ -4,11 +4,33 @@
 -- and identity maturity signals (SIM age, account activity breadth).
 
 CREATE OR REPLACE VIEW vw3_credit_v1_layer1_features AS
-WITH anchor_days AS (
+-- Cast event_dt to DATE once; Presto/Hive returns DATE columns from Hive
+-- tables as BIGINT (days since epoch).
+WITH vw2_data AS (
+    SELECT
+        CAST(event_dt AS DATE) AS event_dt,
+        subscriber_msisdn,
+        loan_disb_amt_day,
+        loan_repaid_amt_day,
+        wallet_inflow_amt_day,
+        wallet_outflow_amt_day,
+        spend_amt_day,
+        savings_amt_day,
+        loan_disb_cnt_day,
+        loan_repay_cnt_day,
+        wallet_txn_cnt_day,
+        lender_family_cnt_day,
+        had_disbursement_day,
+        had_repayment_day,
+        alt_credit_signal_flag_day
+    FROM vw2_credit_v1_subscriber_day
+),
+
+anchor_days AS (
     SELECT DISTINCT
         event_dt AS feature_dt,
         subscriber_msisdn
-    FROM vw2_credit_v1_subscriber_day
+    FROM vw2_data
 ),
 
 -- -----------------------------------------------------------------------
@@ -28,9 +50,9 @@ window_90d AS (
         SUM(b.wallet_txn_cnt_day)     AS wallet_txn_cnt_90d,
         SUM(b.savings_amt_day)        AS savings_amt_90d,
         COUNT(DISTINCT CASE WHEN b.wallet_txn_cnt_day > 0 THEN b.event_dt END) AS wallet_active_days_90d,
-        MIN(b.event_dt)               AS earliest_observed_dt
+        CAST(MIN(b.event_dt) AS DATE) AS earliest_observed_dt
     FROM anchor_days a
-    INNER JOIN vw2_credit_v1_subscriber_day b
+    INNER JOIN vw2_data b
         ON  a.subscriber_msisdn = b.subscriber_msisdn
         AND b.event_dt BETWEEN date_add('day', -89, a.feature_dt) AND a.feature_dt
     GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -52,7 +74,7 @@ window_60d AS (
         SUM(b.loan_repay_cnt_day)     AS repayment_cnt_60d,
         COUNT(DISTINCT CASE WHEN b.wallet_txn_cnt_day > 0 THEN b.event_dt END) AS wallet_active_days_60d
     FROM anchor_days a
-    INNER JOIN vw2_credit_v1_subscriber_day b
+    INNER JOIN vw2_data b
         ON  a.subscriber_msisdn = b.subscriber_msisdn
         AND b.event_dt BETWEEN date_add('day', -59, a.feature_dt) AND a.feature_dt
     GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -77,11 +99,11 @@ window_30d AS (
         COUNT(DISTINCT CASE WHEN b.lender_family_cnt_day > 0 THEN b.event_dt END) AS active_lender_days_30d,
         MAX(b.lender_family_cnt_day)  AS active_lender_cnt_30d,
         MAX(b.alt_credit_signal_flag_day) AS alt_credit_active_flag_30d,
-        MAX(CASE WHEN b.had_disbursement_day = 1 THEN b.event_dt END) AS last_disbursement_dt,
-        MAX(CASE WHEN b.had_repayment_day    = 1 THEN b.event_dt END) AS last_repayment_dt,
+        CAST(MAX(CASE WHEN b.had_disbursement_day = 1 THEN CAST(b.event_dt AS DATE) END) AS DATE) AS last_disbursement_dt,
+        CAST(MAX(CASE WHEN b.had_repayment_day    = 1 THEN CAST(b.event_dt AS DATE) END) AS DATE) AS last_repayment_dt,
         COUNT(DISTINCT CASE WHEN b.wallet_txn_cnt_day > 0 THEN b.event_dt END) AS wallet_active_days_30d
     FROM anchor_days a
-    INNER JOIN vw2_credit_v1_subscriber_day b
+    INNER JOIN vw2_data b
         ON  a.subscriber_msisdn = b.subscriber_msisdn
         AND b.event_dt BETWEEN date_add('day', -29, a.feature_dt) AND a.feature_dt
     GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -103,7 +125,7 @@ window_14d AS (
         SUM(b.loan_repay_cnt_day)     AS repayment_cnt_14d,
         COUNT(DISTINCT CASE WHEN b.wallet_txn_cnt_day > 0 THEN b.event_dt END) AS wallet_active_days_14d
     FROM anchor_days a
-    INNER JOIN vw2_credit_v1_subscriber_day b
+    INNER JOIN vw2_data b
         ON  a.subscriber_msisdn = b.subscriber_msisdn
         AND b.event_dt BETWEEN date_add('day', -13, a.feature_dt) AND a.feature_dt
     GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -125,7 +147,7 @@ window_7d AS (
         SUM(b.loan_repay_cnt_day)     AS repayment_cnt_7d,
         COUNT(DISTINCT CASE WHEN b.wallet_txn_cnt_day > 0 THEN b.event_dt END) AS wallet_active_days_7d
     FROM anchor_days a
-    INNER JOIN vw2_credit_v1_subscriber_day b
+    INNER JOIN vw2_data b
         ON  a.subscriber_msisdn = b.subscriber_msisdn
         AND b.event_dt BETWEEN date_add('day', -6, a.feature_dt) AND a.feature_dt
     GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -149,7 +171,7 @@ post_loan_activity AS (
             ELSE 0.0
         END) AS wallet_activity_prev_7d
     FROM anchor_days a
-    INNER JOIN vw2_credit_v1_subscriber_day b
+    INNER JOIN vw2_data b
         ON  a.subscriber_msisdn = b.subscriber_msisdn
         AND b.event_dt BETWEEN date_add('day', -13, a.feature_dt) AND a.feature_dt
     GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -170,7 +192,7 @@ timing_manipulation AS (
         END) AS inflow_last_2d,
         SUM(b.wallet_inflow_amt_day) / NULLIF(COUNT(b.event_dt), 0) AS avg_daily_inflow_30d
     FROM anchor_days a
-    INNER JOIN vw2_credit_v1_subscriber_day b
+    INNER JOIN vw2_data b
         ON  a.subscriber_msisdn = b.subscriber_msisdn
         AND b.event_dt BETWEEN date_add('day', -29, a.feature_dt) AND a.feature_dt
     GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -206,7 +228,7 @@ repayment_jump AS (
             ELSE NULL
         END AS repayment_ratio_prev_7d
     FROM anchor_days a
-    INNER JOIN vw2_credit_v1_subscriber_day b
+    INNER JOIN vw2_data b
         ON  a.subscriber_msisdn = b.subscriber_msisdn
         AND b.event_dt BETWEEN date_add('day', -13, a.feature_dt) AND a.feature_dt
     GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -227,7 +249,7 @@ loan_cycling AS (
         END) AS same_day_disb_repay_flag,
         COUNT(CASE WHEN b.had_disbursement_day = 1 THEN 1 END) AS disb_days_7d
     FROM anchor_days a
-    INNER JOIN vw2_credit_v1_subscriber_day b
+    INNER JOIN vw2_data b
         ON  a.subscriber_msisdn = b.subscriber_msisdn
         AND b.event_dt BETWEEN date_add('day', -6, a.feature_dt) AND a.feature_dt
     GROUP BY a.feature_dt, a.subscriber_msisdn
@@ -265,12 +287,13 @@ combined AS (
         w30.feature_dt,
         w30.subscriber_msisdn,
 
-        -- 30-day core features (existing)
+        -- 30-day core features
         w30.loan_disb_amt_30d,
         w30.loan_repaid_amt_30d,
         w30.wallet_inflow_amt_30d,
         w30.wallet_outflow_amt_30d,
         w30.spend_amt_30d,
+        w30.savings_amt_30d,
         w30.disbursement_cnt_30d,
         w30.repayment_cnt_30d,
         w30.wallet_txn_cnt_30d,
@@ -357,7 +380,7 @@ final_features AS (
         feature_dt,
         subscriber_msisdn,
 
-        -- Exposure (30d, existing)
+        -- Exposure (30d)
         (loan_disb_amt_30d - loan_repaid_amt_30d) AS outstanding_exposure_amt,
         loan_disb_amt_30d,
         loan_repaid_amt_30d,
@@ -426,15 +449,11 @@ final_features AS (
         active_lender_days_30d,
         alt_credit_active_flag_30d,
 
-        -- Stacking and repeated borrowing flags (existing)
+        -- Stacking and repeated borrowing flags
         CASE WHEN active_lender_cnt_30d >= 2 THEN 1 ELSE 0 END AS stacked_borrowing_flag_30d,
         CASE WHEN disbursement_cnt_30d  >= 3 THEN 1 ELSE 0 END AS repeated_borrowing_flag_30d,
 
-        -- ----------------------------------------------------------------
         -- Anti-gaming flags (Dimension 5)
-        -- ----------------------------------------------------------------
-
-        -- Inflow spike in last 2 days vs 30-day daily average (>2x = suspicious)
         CASE
             WHEN avg_daily_inflow_30d > 0
                  AND inflow_last_2d / avg_daily_inflow_30d > 2.0
@@ -442,7 +461,6 @@ final_features AS (
             ELSE 0
         END AS timing_manipulation_flag,
 
-        -- Repayment ratio jumped >0.50 in a single 7-day window (suspicious clean-up)
         CASE
             WHEN repayment_ratio_last_7d IS NOT NULL
                  AND repayment_ratio_prev_7d IS NOT NULL
@@ -451,17 +469,13 @@ final_features AS (
             ELSE 0
         END AS suspicious_repayment_jump_flag,
 
-        -- Loan cycling: disbursement and repayment on same day within the last 7 days
         COALESCE(same_day_disb_repay_flag, 0) AS loan_cycling_flag,
 
-        -- ----------------------------------------------------------------
         -- Identity maturity signals (Dimension 5)
-        -- ----------------------------------------------------------------
         COALESCE(sim_age_days, 0) AS sim_age_days,
         COALESCE(has_inflow_and_spend_flag, 0) AS has_inflow_and_spend_flag,
         COALESCE(sim_age_cohort, 'thin') AS sim_age_cohort,
 
-        -- Identity confidence upgrade: combines MSISDN presence + maturity signals
         CASE
             WHEN sim_age_days >= 90 AND has_inflow_and_spend_flag = 1 THEN 1.00
             WHEN sim_age_days >= 30 AND has_inflow_and_spend_flag = 1 THEN 0.85
@@ -472,29 +486,22 @@ final_features AS (
     FROM combined
 )
 
+-- Final SELECT column order matches the DDL in deployment/pipeline_view_tables.sql
+-- to ensure positional INSERT INTO alignment.
 SELECT
     feature_dt,
     subscriber_msisdn,
-
-    -- Core exposure and repayment
     outstanding_exposure_amt,
-    active_lender_cnt_30d,
-    disbursement_cnt_30d,
-    disbursement_cnt_7d,
-    disbursement_cnt_14d,
-    disbursement_cnt_60d,
-    disbursement_cnt_90d,
-    days_since_last_disbursement,
+    loan_disb_amt_30d,
+    loan_repaid_amt_30d,
+    last_disbursement_dt,
+    last_repayment_dt,
     repayment_ratio_30d,
     repayment_ratio_14d,
     repayment_ratio_60d,
     repayment_ratio_90d,
     repayment_ratio_trend_7d,
-    repayment_cnt_30d,
-    repayment_cnt_7d,
-    days_since_last_repayment,
-
-    -- Wallet activity across all windows
+    days_since_last_disbursement,
     wallet_inflow_amt_30d,
     wallet_outflow_amt_30d,
     spend_amt_30d,
@@ -510,34 +517,28 @@ SELECT
     wallet_active_days_60d,
     wallet_active_days_90d,
     wallet_inflow_trend_7d_vs_90d,
-
-    -- Post-loan activity
     wallet_activity_last_7d,
     wallet_activity_prev_7d,
     post_loan_wallet_activity_change_ratio,
-
-    -- Behaviour flags
+    disbursement_cnt_30d,
+    disbursement_cnt_7d,
+    disbursement_cnt_14d,
+    disbursement_cnt_60d,
+    disbursement_cnt_90d,
+    repayment_cnt_30d,
+    repayment_cnt_7d,
+    days_since_last_repayment,
+    active_lender_cnt_30d,
+    active_lender_days_30d,
+    alt_credit_active_flag_30d,
     stacked_borrowing_flag_30d,
     repeated_borrowing_flag_30d,
-    alt_credit_active_flag_30d,
-    active_lender_days_30d,
-
-    -- Long-window amounts
-    loan_disb_amt_30d,
-    loan_repaid_amt_30d,
-    last_disbursement_dt,
-    last_repayment_dt,
-
-    -- Anti-gaming flags
     timing_manipulation_flag,
     suspicious_repayment_jump_flag,
     loan_cycling_flag,
-
-    -- Identity maturity signals
     sim_age_days,
     has_inflow_and_spend_flag,
     sim_age_cohort,
     identity_confidence_score_v2
-
 FROM final_features
 ;
