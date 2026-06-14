@@ -30,12 +30,12 @@
 --     Source: wamujap.fm_momo_loan_portfolio_cummulation (loan_repaid=0).
 --     Overdue measured from disbursement_date to analysis_end_date.
 --     No due_date column in source; 30-day loan term assumed (confirmed).
---     Update loan_snapshot_tbl_dt in params to 20260430 when available.
+--     Update loan_snapshot_tbl_dt in params to 20260531 if May snapshot exists.
 --   Rule 6 (cooling-off after delayed repayment):
 --     Source: wamujap.fm_momo_loan_portfolio_cummulation (loan_repaid=1).
 --     Late repayment proxy: days from disbursement to repayment > 30.
 --     30-day loan term confirmed as default. Cooling-off = 90 days.
---     Update loan_snapshot_tbl_dt in params to 20260430 when available.
+--     Update loan_snapshot_tbl_dt in params to 20260531 if May snapshot exists.
 -- ============================================================
 
 CREATE OR REPLACE VIEW vw_loan_eligibility_waterfall AS
@@ -47,10 +47,10 @@ CREATE OR REPLACE VIEW vw_loan_eligibility_waterfall AS
 -- Change window_90d_start to DATE '2026-02-01' when 90-day history is loaded.
 WITH params AS (
     SELECT
-        DATE '2026-04-30'  AS analysis_end_date,
-        DATE '2026-04-01'  AS window_30d_start,
-        DATE '2026-04-01'  AS window_90d_start,
-        20260331           AS loan_snapshot_tbl_dt
+        DATE '2026-05-31'  AS analysis_end_date,
+        DATE '2026-05-01'  AS window_30d_start,
+        DATE '2026-05-01'  AS window_90d_start,   -- still 30-day proxy (May data only)
+        20260331           AS loan_snapshot_tbl_dt -- update to 20260531 if May snapshot exists
 ),
 
 -- ── Rule 1: subscriber registration / activation dates ────────

@@ -505,7 +505,7 @@ def build_executive_summary(df, waterfall_df, config):
         ('Cooling-off affected loan value (UGX)',
          f'{df["cooling_off_affected_loan_value"].sum():,.0f}'),
         ('    ',                                        ''),
-        ('Data window',                                 f'{config["data_window_days"]} days (April 2026)'),
+        ('Data window',                                 f'{config["data_window_days"]} days (May 2026)'),
         ('Sources used',                                'vw1, vw2, vw3, account_holder_dump, fm_momo_loan_portfolio_cummulation'),
         ('Revenue method',                              'loan_disb_amt_30d × 10% margin (no score multiplier)'),
         ('Rule 1 status',                               r1_status),
