@@ -5,9 +5,10 @@
 --
 -- SOURCES:
 --   devdata.account_holder_dump                (subscriber registration — view)
---   vw2_credit_v1_subscriber_day               (daily rollup — physical TABLE)
---   vw3_credit_v1_layer1_features              (30-day rolling features — physical TABLE)
+--   vw2_credit_v1_subscriber_day               (daily rollup — physical TABLE, May 2026)
+--   vw3_credit_v1_layer1_features              (30-day rolling features — physical TABLE, May 2026)
 --   wamujap.fm_momo_loan_portfolio_cummulation (loan portfolio)
+-- NOTE: vw1–vw6 are all physical tables containing data for 20260501–20260531 only.
 -- vw4 (scores), vw5 (reason codes), vw6 (decisions) are
 -- deliberately excluded as those views are not yet verified.
 --
@@ -24,8 +25,9 @@
 --     wallet_inflow + wallet_outflow + spend_behavior + savings.
 --     v1 counted only wallet_inflow + wallet_outflow. All four families
 --     are genuine MoMo activity; the threshold (>= 5) is unchanged.
---   Rules 3 & 4 now use a genuine 90-day window (vw2 physical table
---     contains 90 days of history — 30-day proxy no longer needed).
+--   Rules 3 & 4 still use a 30-day proxy (vw2 physical table contains
+--     May 2026 only — load Feb–Apr 2026 data and set window_90d_start
+--     to DATE '2026-03-02' to switch to a genuine 90-day window).
 --
 -- DATA LIMITATION NOTES:
 --   Rule 1 (MoMo age >= 180 days):
@@ -37,9 +39,10 @@
 --     registration_date and activation_date are VARCHAR YYYYMMDD ('20260501').
 --     Parsed via date_parse(col, '%Y%m%d') with TRY() to handle nulls.
 --   Rules 3 & 4 (transaction count / value windows):
---     NOW USING FULL 90-DAY WINDOW. vw2 physical table contains 90 days
---     of history. window_90d_start = analysis_end_date minus 89 days.
---     To adjust: change window_90d_start in the params CTE only.
+--     30-DAY PROXY ACTIVE. vw2 physical table contains May 2026 only.
+--     window_90d_start currently equals window_30d_start (DATE '2026-05-01').
+--     To switch to a genuine 90-day window: load Feb–Apr data into vw2
+--     and change window_90d_start to DATE '2026-03-02'.
 --   Rule 5 (overdue > 60 days):
 --     Source: wamujap.fm_momo_loan_portfolio_cummulation (loan_repaid=0).
 --     Scoped to 90-day lookback (disbursement_date >= window_90d_start).
@@ -55,12 +58,13 @@ CREATE OR REPLACE VIEW vw_loan_eligibility_waterfall_v2 AS
 -- ── Analysis window parameters ────────────────────────────────
 -- TO CHANGE THE ANALYSIS WINDOW: edit the four values below only.
 -- window_90d_start: lower bound for Rules 3 & 4 and loan overdue scope.
--- vw2 physical table has 90 days of history — full window now active.
+-- Currently equals window_30d_start (30-day proxy — May 2026 data only).
+-- Change window_90d_start to DATE '2026-03-02' once Feb–Apr data is loaded.
 WITH params AS (
     SELECT
         DATE '2026-05-31'  AS analysis_end_date,
         DATE '2026-05-01'  AS window_30d_start,
-        DATE '2026-03-02'  AS window_90d_start,   -- 90 days of history now available in vw2
+        DATE '2026-05-01'  AS window_90d_start,   -- 30-day proxy; extend when more data loaded
         20260531           AS loan_snapshot_tbl_dt
 ),
 
