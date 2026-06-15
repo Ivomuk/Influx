@@ -77,7 +77,7 @@ subscriber_base AS (
         subscriber_msisdn,
         MIN(event_dt)            AS first_activity_dt,
         MAX(event_dt)            AS last_activity_dt,
-        COUNT(DISTINCT event_dt) AS total_active_days
+        approx_distinct(event_dt) AS total_active_days
     FROM vw1_credit_v1_normalized_events
     GROUP BY subscriber_msisdn
 ),
@@ -86,8 +86,8 @@ subscriber_base AS (
 mau30_activity AS (
     SELECT
         v.subscriber_msisdn,
-        COUNT(DISTINCT v.event_dt)                                      AS active_days_last30d,
-        CASE WHEN COUNT(DISTINCT v.event_dt) >= 1 THEN 1 ELSE 0 END    AS mau30_flag
+        approx_distinct(v.event_dt)                                     AS active_days_last30d,
+        CASE WHEN approx_distinct(v.event_dt) >= 1 THEN 1 ELSE 0 END   AS mau30_flag
     FROM vw1_credit_v1_normalized_events v
     CROSS JOIN params p
     WHERE v.event_dt BETWEEN p.window_30d_start AND p.analysis_end_date
@@ -152,7 +152,7 @@ loan_overdue_signals AS (
     -- A loan is overdue if it has been outstanding > 60 days within that window.
     SELECT
         msisdn,
-        COUNT(DISTINCT loan_id)                                        AS overdue_loan_count,
+        approx_distinct(loan_id)                                       AS overdue_loan_count,
         SUM(outstanding_loan)                                          AS total_overdue_amount,
         MAX(date_diff('day', disbursement_date, snapshot_date))        AS max_days_outstanding,
         1                                                              AS overdue_60d_flag
@@ -183,7 +183,7 @@ loan_overdue_signals AS (
 loan_cooling_off_signals AS (
     SELECT
         msisdn,
-        COUNT(DISTINCT loan_id)                           AS cooling_off_loan_count,
+        approx_distinct(loan_id)                          AS cooling_off_loan_count,
         MAX(repayment_date)                               AS latest_late_repayment_date,
         MAX(date_add('day', 90, repayment_date))          AS latest_cooling_off_end_date,
         SUM(loan_disbursed)                               AS cooling_off_affected_loan_value,

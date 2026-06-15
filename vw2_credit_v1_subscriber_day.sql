@@ -15,10 +15,7 @@ WITH daily_rollup AS (
         COUNT_IF(event_family = 'loan_repayment') AS loan_repay_cnt_day,
         COUNT_IF(event_family IN ('wallet_inflow', 'wallet_outflow', 'spend_behavior', 'savings')) AS wallet_txn_cnt_day,
 
-        COUNT(DISTINCT CASE
-            WHEN lender_family_v1 IS NOT NULL THEN lender_family_v1
-            ELSE NULL
-        END) AS lender_family_cnt_day,
+        approx_distinct(lender_family_v1) AS lender_family_cnt_day,  -- approx_distinct ignores NULLs, equivalent to COUNT(DISTINCT non-null)
 
         MAX(CASE WHEN event_family = 'loan_disbursement' THEN 1 ELSE 0 END) AS had_disbursement_day,
         MAX(CASE WHEN event_family = 'loan_repayment'    THEN 1 ELSE 0 END) AS had_repayment_day,

@@ -95,12 +95,12 @@ vw2_aggregated AS (
         -- subscriber_base equivalents
         MIN(d.event_dt)               AS first_activity_dt,
         MAX(d.event_dt)               AS last_activity_dt,
-        COUNT(DISTINCT d.event_dt)    AS total_active_days,
+        COUNT(*)                      AS total_active_days,   -- vw2 grain: one row per (subscriber, day) so COUNT(*) = COUNT(DISTINCT event_dt)
         -- Rule 2: MAU30 — days with any activity in the 30-day window
-        COUNT(DISTINCT CASE
+        SUM(CASE
             WHEN d.event_dt BETWEEN p.window_30d_start AND p.analysis_end_date
-            THEN d.event_dt
-        END)                          AS active_days_last30d,
+            THEN 1 ELSE 0
+        END)                          AS active_days_last30d, -- SUM(1) safe: one row per day per subscriber in vw2
         -- Rule 3: wallet transaction count in window
         -- vw2.wallet_txn_cnt_day counts wallet_inflow + wallet_outflow + spend_behavior
         SUM(CASE
@@ -160,7 +160,7 @@ loan_portfolio_base AS (
 loan_overdue_signals AS (
     SELECT
         msisdn,
-        COUNT(DISTINCT loan_id)                                        AS overdue_loan_count,
+        approx_distinct(loan_id)                                       AS overdue_loan_count,
         SUM(outstanding_loan)                                          AS total_overdue_amount,
         MAX(date_diff('day', disbursement_date, snapshot_date))        AS max_days_outstanding,
         1                                                              AS overdue_60d_flag
@@ -177,7 +177,7 @@ loan_overdue_signals AS (
 loan_cooling_off_signals AS (
     SELECT
         msisdn,
-        COUNT(DISTINCT loan_id)                          AS cooling_off_loan_count,
+        approx_distinct(loan_id)                         AS cooling_off_loan_count,
         MAX(repayment_date)                              AS latest_late_repayment_date,
         MAX(date_add('day', 90, repayment_date))         AS latest_cooling_off_end_date,
         SUM(loan_disbursed)                              AS cooling_off_affected_loan_value,
