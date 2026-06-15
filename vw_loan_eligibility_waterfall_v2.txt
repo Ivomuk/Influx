@@ -4,24 +4,28 @@
 -- Produces identical columns and the same eligibility logic.
 --
 -- SOURCES:
---   devdata.account_holder_dump                (subscriber registration)
---   vw2_credit_v1_subscriber_day               (daily rollup of vw1 events)
---   vw3_credit_v1_layer1_features              (30-day rolling features)
+--   devdata.account_holder_dump                (subscriber registration — view)
+--   vw2_credit_v1_subscriber_day               (daily rollup — physical TABLE)
+--   vw3_credit_v1_layer1_features              (30-day rolling features — physical TABLE)
 --   wamujap.fm_momo_loan_portfolio_cummulation (loan portfolio)
 -- vw4 (scores), vw5 (reason codes), vw6 (decisions) are
 -- deliberately excluded as those views are not yet verified.
 --
 -- OPTIMISATION NOTES vs v1:
 --   vw1 scanned 3× (subscriber_base, mau30_activity, momo_activity) →
---     replaced by a single scan of vw2 (daily grain, far fewer rows).
+--     replaced by a single scan of vw2, now a physical table (no vw1
+--     CASE WHEN chain re-executed at query time).
+--   vw3 is also a physical table — layer1_latest reads storage directly.
 --   loan portfolio table scanned 2× → replaced by a single
 --     loan_portfolio_base CTE; VARCHAR→DATE conversion done once.
 --   layer1_latest ROW_NUMBER() over all rows replaced with a MAX()
 --     subquery join that finds the latest date first.
---   Rule 3 txn count now uses vw2.wallet_txn_cnt_day which counts
+--   Rule 3 txn count uses vw2.wallet_txn_cnt_day which counts
 --     wallet_inflow + wallet_outflow + spend_behavior + savings.
 --     v1 counted only wallet_inflow + wallet_outflow. All four families
 --     are genuine MoMo activity; the threshold (>= 5) is unchanged.
+--   Rules 3 & 4 now use a genuine 90-day window (vw2 physical table
+--     contains 90 days of history — 30-day proxy no longer needed).
 --
 -- DATA LIMITATION NOTES:
 --   Rule 1 (MoMo age >= 180 days):
@@ -33,11 +37,9 @@
 --     registration_date and activation_date are VARCHAR YYYYMMDD ('20260501').
 --     Parsed via date_parse(col, '%Y%m%d') with TRY() to handle nulls.
 --   Rules 3 & 4 (transaction count / value windows):
---     Controlled by params.window_90d_start and params.analysis_end_date.
---     vw1 now uses a dynamic rolling 90-day window (current_date - 90d to
---     current_date), so full 90-day history is available whenever vw1 is run.
---     To use 90 days: set window_90d_start = date_add('day',-90,analysis_end_date)
---     in the params CTE — no other changes needed.
+--     NOW USING FULL 90-DAY WINDOW. vw2 physical table contains 90 days
+--     of history. window_90d_start = analysis_end_date minus 89 days.
+--     To adjust: change window_90d_start in the params CTE only.
 --   Rule 5 (overdue > 60 days):
 --     Source: wamujap.fm_momo_loan_portfolio_cummulation (loan_repaid=0).
 --     Scoped to 90-day lookback (disbursement_date >= window_90d_start).
@@ -53,13 +55,12 @@ CREATE OR REPLACE VIEW vw_loan_eligibility_waterfall_v2 AS
 -- ── Analysis window parameters ────────────────────────────────
 -- TO CHANGE THE ANALYSIS WINDOW: edit the four values below only.
 -- window_90d_start: lower bound for Rules 3 & 4 and loan overdue scope.
--- Currently equals window_30d_start (30-day proxy — May 2026 data only).
--- Change window_90d_start to DATE '2026-03-02' when 90-day history is loaded.
+-- vw2 physical table has 90 days of history — full window now active.
 WITH params AS (
     SELECT
         DATE '2026-05-31'  AS analysis_end_date,
         DATE '2026-05-01'  AS window_30d_start,
-        DATE '2026-05-01'  AS window_90d_start,   -- extend to DATE '2026-03-02' for 90d
+        DATE '2026-03-02'  AS window_90d_start,   -- 90 days of history now available in vw2
         20260531           AS loan_snapshot_tbl_dt
 ),
 
@@ -82,8 +83,8 @@ subscriber_reg AS (
 ),
 
 -- ── Single vw2 scan: replaces subscriber_base + mau30_activity + momo_activity ──
--- vw2 is at (event_dt, subscriber_msisdn) daily grain — far fewer rows than vw1.
--- Conditional aggregation computes all three CTE outputs in one pass.
+-- vw2 is a physical table at (event_dt, subscriber_msisdn) daily grain.
+-- 90 days of history available. Conditional aggregation in one pass.
 vw2_aggregated AS (
     SELECT
         d.subscriber_msisdn,
