@@ -18,7 +18,7 @@ WITH raw_base AS (
         from_sp,
         to_sp
     FROM analytics.momo_tran_loc_mapping_v2
-    WHERE date_key BETWEEN 20260401 AND 20260430
+    WHERE date_key BETWEEN 20260501 AND 20260531
 ),
 base_events AS (
     SELECT
