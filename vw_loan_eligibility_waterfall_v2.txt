@@ -50,7 +50,10 @@
 --     and change window_90d_start to DATE '2026-03-02'.
 --   Rule 5 (overdue > 60 days):
 --     Source: wamujap.fm_momo_loan_portfolio_cummulation (loan_repaid=0).
---     Scoped to 90-day lookback (disbursement_date >= window_90d_start).
+--     Scoped to tbl_dt snapshot only (no disbursement_date lower bound).
+--     lookback_start is NOT applied here — it applies only to Rules 3 & 4.
+--     A loan overdue > 60 days as of May 31 was disbursed before April 1,
+--     outside any 30-day proxy window, so window_90d_start cannot be reused.
 --     No due_date in source; 30-day loan term assumed (confirmed).
 --   Rule 6 (cooling-off after delayed repayment):
 --     Source: wamujap.fm_momo_loan_portfolio_cummulation (loan_repaid=1).
@@ -146,6 +149,8 @@ vw2_aggregated AS (
 -- VARCHAR YYYYMMDD → DATE conversion done once in the inner sub-select.
 -- cooling_off_end_date pre-computed here so loan_cooling_off_signals
 -- avoids repeating date_add('day', 90, repayment_date) in two places.
+-- Pre-filtered to vw2 msisdns: the waterfall output is driven by vw2_aggregated
+-- so loan data for non-vw2 subscribers is never used.
 loan_portfolio_base AS (
     SELECT
         msisdn, loan_id, loan_disbursed, outstanding_loan, loan_repaid,
@@ -171,11 +176,16 @@ loan_portfolio_base AS (
         CROSS JOIN params p
         WHERE lp.tbl_dt            = p.loan_snapshot_tbl_dt
           AND lp.disbursement_date IS NOT NULL
+          AND lp.msisdn IN (SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day)
     )
 ),
 
 -- ── Rule 5: overdue loans (active, unrepaid, > 60 days old) ──
--- Scoped to 90-day lookback to align with transaction window.
+-- No lookback_start filter here. lookback_start scopes Rules 3 & 4 (transaction
+-- windows) but is incompatible with Rule 5: a loan overdue > 60 days as of
+-- May 31 was by definition disbursed before April 1, which is outside the
+-- 30-day proxy window (May 1). The tbl_dt filter in loan_portfolio_base already
+-- limits the scan to the May 31 snapshot — no further date scoping is needed.
 loan_overdue_signals AS (
     SELECT
         msisdn,
@@ -184,10 +194,9 @@ loan_overdue_signals AS (
         MAX(date_diff('day', disbursement_date, snapshot_date))        AS max_days_outstanding,
         1                                                              AS overdue_60d_flag
     FROM loan_portfolio_base
-    WHERE loan_repaid       = 0
-      AND outstanding_loan  > 0
-      AND disbursement_date >= lookback_start
-      AND disbursement_date  < date_add('day', -60, snapshot_date)   -- equivalent to date_diff > 60; range form aids pushdown
+    WHERE loan_repaid      = 0
+      AND outstanding_loan > 0
+      AND disbursement_date < date_add('day', -60, snapshot_date)   -- disbursed > 60 days before analysis date
     GROUP BY msisdn
 ),
 
