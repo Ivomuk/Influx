@@ -18,10 +18,10 @@
 --     loan_portfolio_base CTE; VARCHAR→DATE conversion done once.
 --   layer1_latest ROW_NUMBER() over all rows replaced with a MAX()
 --     subquery join that finds the latest date first.
---   Rule 3 txn count now uses vw2.wallet_txn_cnt_day which includes
---     spend_behavior. v1 counted only wallet_inflow + wallet_outflow.
---     spend_behavior is a valid MoMo transaction so this is more complete;
---     the threshold (>= 5) is unchanged.
+--   Rule 3 txn count now uses vw2.wallet_txn_cnt_day which counts
+--     wallet_inflow + wallet_outflow + spend_behavior + savings.
+--     v1 counted only wallet_inflow + wallet_outflow. All four families
+--     are genuine MoMo activity; the threshold (>= 5) is unchanged.
 --
 -- DATA LIMITATION NOTES:
 --   Rule 1 (MoMo age >= 180 days):
@@ -34,8 +34,9 @@
 --     Parsed via date_parse(col, '%Y%m%d') with TRY() to handle nulls.
 --   Rules 3 & 4 (transaction count / value windows):
 --     Controlled by params.window_90d_start and params.analysis_end_date.
---     Currently set to a 30-day window (May 2026 data only).
---     To extend to 90 days: change window_90d_start to DATE '2026-03-02'
+--     vw1 now uses a dynamic rolling 90-day window (current_date - 90d to
+--     current_date), so full 90-day history is available whenever vw1 is run.
+--     To use 90 days: set window_90d_start = date_add('day',-90,analysis_end_date)
 --     in the params CTE — no other changes needed.
 --   Rule 5 (overdue > 60 days):
 --     Source: wamujap.fm_momo_loan_portfolio_cummulation (loan_repaid=0).
