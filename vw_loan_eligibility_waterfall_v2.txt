@@ -14,17 +14,22 @@
 --
 -- OPTIMISATION NOTES vs v1:
 --   vw1 scanned 3× (subscriber_base, mau30_activity, momo_activity) →
---     replaced by a single scan of vw2, now a physical table (no vw1
---     CASE WHEN chain re-executed at query time).
---   vw3 is also a physical table — layer1_latest reads storage directly.
+--     replaced by a single scan of vw2 (physical table, daily grain).
+--   layer1_latest CTE removed entirely. vw3 (physical table) is joined
+--     directly on (subscriber_msisdn, last_activity_dt) — a primary-key
+--     lookup. MAX(feature_dt) in vw3 = MAX(event_dt) in vw2 = last_activity_dt
+--     already computed in vw2_aggregated. Eliminates a double scan of vw3.
+--   account_holder_dump (a view) pre-filtered to msisdns in vw2 before
+--     the hash join is built — avoids loading the full subscriber base
+--     into memory when only May transactors are needed.
 --   loan portfolio table scanned 2× → replaced by a single
---     loan_portfolio_base CTE; VARCHAR→DATE conversion done once.
---   layer1_latest ROW_NUMBER() over all rows replaced with a MAX()
---     subquery join that finds the latest date first.
---   Rule 3 txn count uses vw2.wallet_txn_cnt_day which counts
---     wallet_inflow + wallet_outflow + spend_behavior + savings.
---     v1 counted only wallet_inflow + wallet_outflow. All four families
---     are genuine MoMo activity; the threshold (>= 5) is unchanged.
+--     loan_portfolio_base CTE; VARCHAR→DATE conversion and cooling_off_end_date
+--     computed once.
+--   date_diff() in WHERE clauses replaced by range comparisons to aid
+--     predicate pushdown.
+--   Rule 3 txn count uses vw2.wallet_txn_cnt_day (wallet_inflow +
+--     wallet_outflow + spend_behavior + savings). v1 counted only
+--     wallet_inflow + wallet_outflow. Threshold (>= 5) unchanged.
 --   Rules 3 & 4 still use a 30-day proxy (vw2 physical table contains
 --     May 2026 only — load Feb–Apr 2026 data and set window_90d_start
 --     to DATE '2026-03-02' to switch to a genuine 90-day window).
@@ -72,6 +77,9 @@ WITH params AS (
 -- Source: devdata.account_holder_dump (MOBILE MONEY, ACTIVE accounts only).
 -- registration_date and activation_date are VARCHAR YYYYMMDD (e.g. '20260501').
 -- Sub-select parses each date column once; outer SELECT aliases and derives.
+-- Pre-filtered to msisdns present in vw2 — account_holder_dump is a view and
+-- can be very large; filtering here prevents a full scan being built into the
+-- hash join with vw2_aggregated.
 subscriber_reg AS (
     SELECT
         msisdn,
@@ -87,6 +95,7 @@ subscriber_reg AS (
         WHERE account_type   = 'MOBILE MONEY'
           AND account_status = 'ACTIVE'
           AND msisdn        != ''
+          AND msisdn IN (SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day)
     )
 ),
 
@@ -125,18 +134,13 @@ vw2_aggregated AS (
     GROUP BY d.subscriber_msisdn
 ),
 
--- ── Layer 1: most-recent feature snapshot per subscriber ──────
--- MAX subquery finds the latest date first; avoids ROW_NUMBER over all rows.
-layer1_latest AS (
-    SELECT l.*
-    FROM vw3_credit_v1_layer1_features l
-    INNER JOIN (
-        SELECT subscriber_msisdn, MAX(feature_dt) AS latest_feature_dt
-        FROM vw3_credit_v1_layer1_features
-        GROUP BY subscriber_msisdn
-    ) m ON  l.subscriber_msisdn = m.subscriber_msisdn
-        AND l.feature_dt        = m.latest_feature_dt
-),
+-- layer1_latest CTE removed.
+-- vw3 is joined directly on (subscriber_msisdn, last_activity_dt) in eligibility_base.
+-- Rationale: vw3 rows are keyed by (subscriber_msisdn, feature_dt) where feature_dt
+-- comes from anchor_days = SELECT DISTINCT event_dt FROM vw2. Therefore
+-- MAX(feature_dt) in vw3 = MAX(event_dt) in vw2 = last_activity_dt already
+-- computed in vw2_aggregated. Joining on last_activity_dt is a direct primary-key
+-- lookup — one scan instead of the previous double scan (inner MAX + outer join).
 
 -- ── Single loan portfolio scan: shared by Rules 5 & 6 ────────
 -- VARCHAR YYYYMMDD → DATE conversion done once in the inner sub-select.
@@ -281,10 +285,11 @@ eligibility_base AS (
 
         FROM vw2_aggregated agg
         CROSS JOIN params p
-        LEFT JOIN subscriber_reg             sr  ON agg.subscriber_msisdn = sr.msisdn
-        LEFT JOIN layer1_latest              l1  ON agg.subscriber_msisdn = l1.subscriber_msisdn
-        LEFT JOIN loan_overdue_signals       lov ON agg.subscriber_msisdn = lov.msisdn
-        LEFT JOIN loan_cooling_off_signals   lco ON agg.subscriber_msisdn = lco.msisdn
+        LEFT JOIN subscriber_reg                      sr  ON agg.subscriber_msisdn = sr.msisdn
+        LEFT JOIN vw3_credit_v1_layer1_features       l1  ON  l1.subscriber_msisdn = agg.subscriber_msisdn
+                                                          AND l1.feature_dt         = agg.last_activity_dt
+        LEFT JOIN loan_overdue_signals                lov ON agg.subscriber_msisdn = lov.msisdn
+        LEFT JOIN loan_cooling_off_signals            lco ON agg.subscriber_msisdn = lco.msisdn
     )
 ),
 
