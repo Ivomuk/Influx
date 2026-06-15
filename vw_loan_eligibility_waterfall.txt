@@ -148,6 +148,9 @@ layer1_latest AS (
 -- Snapshot date = params.analysis_end_date (not the tbl_dt snapshot date).
 -- Update loan_snapshot_tbl_dt in params to 20260430 when available.
 loan_overdue_signals AS (
+    -- Scope: unrepaid loans disbursed within the 90-day lookback window only.
+    -- Aligns with Rules 3 & 4 window and avoids pulling ancient write-off loans.
+    -- A loan is overdue if it has been outstanding > 60 days within that window.
     SELECT
         msisdn,
         COUNT(DISTINCT loan_id)                                        AS overdue_loan_count,
@@ -160,14 +163,16 @@ loan_overdue_signals AS (
             lp.loan_id,
             lp.outstanding_loan,
             CAST(date_parse(CAST(lp.disbursement_date AS VARCHAR), '%Y%m%d') AS DATE) AS disbursement_date,
-            p.analysis_end_date                                                         AS snapshot_date
+            p.analysis_end_date                                                         AS snapshot_date,
+            p.window_90d_start                                                          AS lookback_start
         FROM wamujap.fm_momo_loan_portfolio_cummulation lp
         CROSS JOIN params p
-        WHERE lp.tbl_dt          = p.loan_snapshot_tbl_dt
-          AND lp.loan_repaid     = 0
+        WHERE lp.tbl_dt            = p.loan_snapshot_tbl_dt
+          AND lp.loan_repaid       = 0
           AND lp.disbursement_date IS NOT NULL
     ) t
     WHERE outstanding_loan > 0
+      AND disbursement_date >= lookback_start               -- 90-day scope
       AND date_diff('day', disbursement_date, snapshot_date) > 60
     GROUP BY msisdn
 ),
