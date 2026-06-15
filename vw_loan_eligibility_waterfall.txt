@@ -5,9 +5,8 @@
 --
 -- SOURCES:
 --   devdata.account_holder_dump                (subscriber registration)
---   vw1_credit_v1_normalized_events            (transaction-level)
---   vw2_credit_v1_subscriber_day               (daily rollup)
---   vw3_credit_v1_layer1_features              (30-day features)
+--   vw1_credit_v1_normalized_events            (transaction-level events)
+--   vw3_credit_v1_layer1_features              (30-day rolling features)
 --   wamujap.fm_momo_loan_portfolio_cummulation (loan portfolio)
 -- vw4 (scores), vw5 (reason codes), vw6 (decisions) are
 -- deliberately excluded as those views are not yet verified.
