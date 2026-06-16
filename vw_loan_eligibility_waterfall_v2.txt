@@ -307,6 +307,7 @@ eligibility_base AS (
         LEFT JOIN subscriber_reg                      sr  ON agg.subscriber_msisdn = sr.msisdn
         LEFT JOIN vw3_credit_v1_layer1_features       l1  ON  l1.subscriber_msisdn = agg.subscriber_msisdn
                                                           AND l1.feature_dt         = agg.last_activity_dt
+                                                          AND l1.run_date           = DATE '2026-05-31'  -- literal partition key
         LEFT JOIN loan_overdue_signals                lov ON agg.subscriber_msisdn = lov.msisdn
         LEFT JOIN loan_cooling_off_signals            lco ON agg.subscriber_msisdn = lco.msisdn
     )
