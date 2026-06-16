@@ -64,16 +64,17 @@
 CREATE OR REPLACE VIEW vw_loan_eligibility_waterfall_v2 AS
 
 -- ── Analysis window parameters ────────────────────────────────
--- TO CHANGE THE ANALYSIS WINDOW: edit the four values below only.
--- window_90d_start: lower bound for Rules 3 & 4 and loan overdue scope.
+-- TO CHANGE THE ANALYSIS WINDOW: edit the three values below only.
+-- window_90d_start: lower bound for Rules 3 & 4.
 -- Currently equals window_30d_start (30-day proxy — May 2026 data only).
 -- Change window_90d_start to DATE '2026-03-02' once Feb–Apr data is loaded.
+-- NOTE: loan_snapshot_tbl_dt removed — the loan snapshot is now pre-materialised
+-- in wamujap.loan_snapshot_20260531 via pre_run_loan_snapshot.sql.
 WITH params AS (
     SELECT
         DATE '2026-05-31'  AS analysis_end_date,
         DATE '2026-05-01'  AS window_30d_start,
-        DATE '2026-05-01'  AS window_90d_start,   -- 30-day proxy; extend when more data loaded
-        20260531           AS loan_snapshot_tbl_dt
+        DATE '2026-05-01'  AS window_90d_start    -- 30-day proxy; extend when more data loaded
 ),
 
 -- ── Rule 1: subscriber registration / activation dates ────────
@@ -146,6 +147,13 @@ vw2_aggregated AS (
 -- lookup — one scan instead of the previous double scan (inner MAX + outer join).
 
 -- ── Single loan portfolio scan: shared by Rules 5 & 6 ────────
+-- IMPORTANT: run pre_run_loan_snapshot.sql first to create
+-- wamujap.loan_snapshot_20260531 before querying this view.
+-- The source table (fm_momo_loan_portfolio_cummulation) is not partitioned
+-- by tbl_dt — a COUNT(*) WHERE tbl_dt=20260531 takes ~1m 45s (full scan).
+-- The pre-materialised snapshot contains only the relevant date and
+-- disbursement_date >= 20240101, reducing the scan from the full history
+-- to a small table that JOINs in milliseconds.
 -- VARCHAR YYYYMMDD → DATE conversion done once in the inner sub-select.
 -- cooling_off_end_date pre-computed here so loan_cooling_off_signals
 -- avoids repeating date_add('day', 90, repayment_date) in two places.
@@ -172,14 +180,9 @@ loan_portfolio_base AS (
             END                                                                         AS repayment_date,
             p.analysis_end_date  AS snapshot_date,
             p.window_90d_start   AS lookback_start
-        FROM wamujap.fm_momo_loan_portfolio_cummulation lp
+        FROM wamujap.loan_snapshot_20260531 lp   -- pre-materialised snapshot (see pre_run_loan_snapshot.sql)
         CROSS JOIN params p
-        WHERE lp.tbl_dt            = p.loan_snapshot_tbl_dt
-          AND lp.disbursement_date IS NOT NULL
-          AND lp.disbursement_date >= 20240101   -- raw numeric guard: loans before Jan 2024 cannot be relevant
-                                                 -- (>60d overdue check and 90d cooling-off window both
-                                                 --  apply within ~5 months of analysis_end_date)
-          AND lp.msisdn IN (SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day)
+        WHERE lp.msisdn IN (SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day)
     )
 ),
 
