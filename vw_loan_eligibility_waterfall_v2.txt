@@ -63,21 +63,26 @@
 
 CREATE OR REPLACE VIEW vw_loan_eligibility_waterfall_v2 AS
 
--- ── Analysis window parameters ────────────────────────────────
--- TO CHANGE THE ANALYSIS WINDOW: edit the values below only.
--- window_90d_start: lower bound for Rules 3 & 4.
--- Currently equals window_30d_start (30-day proxy — May 2026 data only).
--- Change window_90d_start to DATE '2026-03-02' once Feb–Apr data is loaded.
--- vw2_run_date: the run_date partition of vw2_credit_v1_subscriber_day to use.
---   vw2 is partitioned by run_date. Using a literal here ensures Trino prunes
---   to a single partition at plan time. A CROSS JOIN CTE value would defeat pruning.
--- NOTE: loan_snapshot_tbl_dt removed — loan snapshot is pre-materialised
---   in wamujap.loan_snapshot_20260531 via pre_run_loan_snapshot.sql.
+-- ── Analysis window & partition key reference ─────────────────
+-- TO CHANGE THE ANALYSIS CYCLE: update ALL FIVE values below consistently,
+-- then search-replace each literal throughout this file.
+--
+--   analysis_end_date  DATE '2026-05-31'   last day of the analysis month
+--   window_30d_start   DATE '2026-05-01'   first day of the analysis month
+--   window_90d_start   DATE '2026-05-01'   90-day lookback start (= 30d proxy while only 1 month loaded)
+--   run_date           DATE '2026-05-31'   partition key for vw2 and vw3  ← literal in WHERE, not in CTE
+--   tbl_dt             20260531            partition key for loan portfolio ← literal in WHERE, not in CTE
+--
+-- WHY run_date and tbl_dt are NOT in the params CTE:
+--   Trino resolves partition keys at PLAN TIME from literal constants only.
+--   A value derived from a CROSS JOIN CTE is resolved at RUNTIME, causing
+--   Trino to scan ALL partitions before filtering. Using literals ensures
+--   partition pruning fires and each table scan reads only the target partition.
 WITH params AS (
     SELECT
         DATE '2026-05-31'  AS analysis_end_date,
         DATE '2026-05-01'  AS window_30d_start,
-        DATE '2026-05-01'  AS window_90d_start    -- 30-day proxy; extend when more data loaded
+        DATE '2026-05-01'  AS window_90d_start    -- 30-day proxy; change to DATE '2026-03-02' when Feb–Apr data is loaded
 ),
 
 -- ── Rule 1: subscriber registration / activation dates ────────
@@ -151,18 +156,15 @@ vw2_aggregated AS (
 -- lookup — one scan instead of the previous double scan (inner MAX + outer join).
 
 -- ── Single loan portfolio scan: shared by Rules 5 & 6 ────────
--- IMPORTANT: run pre_run_loan_snapshot.sql first to create
--- wamujap.loan_snapshot_20260531 before querying this view.
--- The source table (fm_momo_loan_portfolio_cummulation) is not partitioned
--- by tbl_dt — a COUNT(*) WHERE tbl_dt=20260531 takes ~1m 45s (full scan).
--- The pre-materialised snapshot contains only the relevant date and
--- disbursement_date >= 20240101, reducing the scan from the full history
--- to a small table that JOINs in milliseconds.
+-- tbl_dt = 20260531 is a literal constant so Trino prunes to that partition
+-- at plan time. Using a CTE-derived value (e.g. p.loan_snapshot_tbl_dt) would
+-- defeat pruning and cause a full cross-partition scan (tested: ~50 min).
+-- disbursement_date >= 20240101 is a raw integer comparison applied at scan
+-- time to skip pre-2024 rows before date conversion.
+-- Pre-filtered to vw2 msisdns: only subscribers in the waterfall output are needed.
 -- VARCHAR YYYYMMDD → DATE conversion done once in the inner sub-select.
--- cooling_off_end_date pre-computed here so loan_cooling_off_signals
--- avoids repeating date_add('day', 90, repayment_date) in two places.
--- Pre-filtered to vw2 msisdns: the waterfall output is driven by vw2_aggregated
--- so loan data for non-vw2 subscribers is never used.
+-- cooling_off_end_date pre-computed so loan_cooling_off_signals avoids
+-- repeating date_add('day', 90, repayment_date) in two places.
 loan_portfolio_base AS (
     SELECT
         msisdn, loan_id, loan_disbursed, outstanding_loan, loan_repaid,
@@ -184,9 +186,12 @@ loan_portfolio_base AS (
             END                                                                         AS repayment_date,
             p.analysis_end_date  AS snapshot_date,
             p.window_90d_start   AS lookback_start
-        FROM wamujap.loan_snapshot_20260531 lp   -- pre-materialised snapshot (see pre_run_loan_snapshot.sql)
+        FROM wamujap.fm_momo_loan_portfolio_cummulation lp
         CROSS JOIN params p
-        WHERE lp.msisdn IN (SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day WHERE run_date = DATE '2026-05-31')
+        WHERE lp.tbl_dt            = 20260531              -- literal partition key (see params header note)
+          AND lp.disbursement_date IS NOT NULL
+          AND lp.disbursement_date >= 20240101              -- raw integer guard; skip pre-2024 rows at scan time
+          AND lp.msisdn IN (SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day WHERE run_date = DATE '2026-05-31')
     )
 ),
 
