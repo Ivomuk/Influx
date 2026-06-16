@@ -70,7 +70,7 @@ CREATE OR REPLACE VIEW vw_loan_eligibility_waterfall_v2 AS
 --   analysis_end_date  DATE '2026-05-31'   last day of the analysis month
 --   window_30d_start   DATE '2026-05-01'   first day of the analysis month
 --   window_90d_start   DATE '2026-05-01'   90-day lookback start (= 30d proxy while only 1 month loaded)
---   run_date           DATE '2026-05-31'   partition key for vw2 and vw3  ← literal in WHERE, not in CTE
+--   run_date           '2026-05-31'        partition key for vw2 and vw3 (VARCHAR) ← literal in WHERE, not in CTE
 --   tbl_dt             20260531            partition key for loan portfolio ← literal in WHERE, not in CTE
 --
 -- WHY run_date and tbl_dt are NOT in the params CTE:
@@ -107,7 +107,7 @@ subscriber_reg AS (
         WHERE account_type   = 'MOBILE MONEY'
           AND account_status = 'ACTIVE'
           AND msisdn        != ''
-          AND msisdn IN (SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day WHERE run_date = DATE '2026-05-31')
+          AND msisdn IN (SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day WHERE run_date = '2026-05-31')
     )
 ),
 
@@ -143,7 +143,7 @@ vw2_aggregated AS (
         END)                          AS momo_outflow_30d
     FROM vw2_credit_v1_subscriber_day d
     CROSS JOIN params p
-    WHERE d.run_date = DATE '2026-05-31'   -- literal partition key: Trino prunes at plan time
+    WHERE d.run_date = '2026-05-31'   -- literal partition key: Trino prunes at plan time (VARCHAR column)
     GROUP BY d.subscriber_msisdn
 ),
 
@@ -191,7 +191,7 @@ loan_portfolio_base AS (
         WHERE lp.tbl_dt            = 20260531              -- literal partition key (see params header note)
           AND lp.disbursement_date IS NOT NULL
           AND lp.disbursement_date >= 20240101              -- raw integer guard; skip pre-2024 rows at scan time
-          AND lp.msisdn IN (SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day WHERE run_date = DATE '2026-05-31')
+          AND lp.msisdn IN (SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day WHERE run_date = '2026-05-31')
     )
 ),
 
@@ -312,7 +312,7 @@ eligibility_base AS (
         LEFT JOIN subscriber_reg                      sr  ON agg.subscriber_msisdn = sr.msisdn
         LEFT JOIN vw3_credit_v1_layer1_features       l1  ON  l1.subscriber_msisdn = agg.subscriber_msisdn
                                                           AND l1.feature_dt         = agg.last_activity_dt
-                                                          AND l1.run_date           = DATE '2026-05-31'  -- literal partition key
+                                                          AND l1.run_date           = '2026-05-31'  -- literal partition key (VARCHAR column)
         LEFT JOIN loan_overdue_signals                lov ON agg.subscriber_msisdn = lov.msisdn
         LEFT JOIN loan_cooling_off_signals            lco ON agg.subscriber_msisdn = lco.msisdn
     )
