@@ -176,6 +176,9 @@ loan_portfolio_base AS (
         CROSS JOIN params p
         WHERE lp.tbl_dt            = p.loan_snapshot_tbl_dt
           AND lp.disbursement_date IS NOT NULL
+          AND lp.disbursement_date >= 20240101   -- raw numeric guard: loans before Jan 2024 cannot be relevant
+                                                 -- (>60d overdue check and 90d cooling-off window both
+                                                 --  apply within ~5 months of analysis_end_date)
           AND lp.msisdn IN (SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day)
     )
 ),
