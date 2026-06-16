@@ -8,7 +8,7 @@
 SET SESSION hive.insert_existing_partitions_behavior = 'OVERWRITE';
 
 INSERT INTO hive.credit_engine.vw4_credit_v1_layer0_scores
-SELECT t.*, 'YYYY-MM-DD' AS run_date
+SELECT t.*, '2026-05-31' AS run_date
 FROM (
     -- Cast feature_dt to DATE once; Presto/Hive returns DATE columns from Hive
     -- tables as BIGINT (days since epoch).
@@ -267,7 +267,7 @@ FROM (
         wallet_inflow_trend_7d_vs_90d
     FROM final_scores
 ) t
-WHERE t.feature_dt = DATE 'YYYY-MM-DD'
+WHERE t.feature_dt = DATE '2026-05-31'
 ;
 
 SET SESSION hive.insert_existing_partitions_behavior = 'APPEND';

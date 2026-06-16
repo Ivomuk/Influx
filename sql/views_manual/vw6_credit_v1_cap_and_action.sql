@@ -5,7 +5,7 @@
 SET SESSION hive.insert_existing_partitions_behavior = 'OVERWRITE';
 
 INSERT INTO hive.credit_engine.vw6_credit_v1_cap_and_action
-SELECT t.*, 'YYYY-MM-DD' AS run_date
+SELECT t.*, '2026-05-31' AS run_date
 FROM (
     -- Cast feature_dt to DATE in all source tables; Presto/Hive returns DATE
     -- columns from Hive tables as BIGINT (days since epoch).
@@ -115,7 +115,7 @@ FROM (
         conservative_credit_limit_v1
     FROM credit_caps
 ) t
-WHERE t.feature_dt = DATE 'YYYY-MM-DD'
+WHERE t.feature_dt = DATE '2026-05-31'
 ;
 
 SET SESSION hive.insert_existing_partitions_behavior = 'APPEND';

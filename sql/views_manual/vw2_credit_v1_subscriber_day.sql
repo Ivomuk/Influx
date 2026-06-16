@@ -1,23 +1,26 @@
 -- Manual INSERT script for vw2_credit_v1_subscriber_day.
 -- Depends on vw1_credit_v1_normalized_events — run vw1 first.
--- Replace YYYY-MM-DD with the execution date before running.
+--
+-- Aggregates all 90 days loaded in vw1 (2026-03-03 → 2026-05-31) into
+-- daily subscriber rollups under a single run_date = '2026-05-31' partition.
+-- No outer date filter — all event_dt values from vw1 are aggregated.
 
 SET SESSION hive.insert_existing_partitions_behavior = 'OVERWRITE';
 
 INSERT INTO hive.credit_engine.vw2_credit_v1_subscriber_day
-SELECT t.*, 'YYYY-MM-DD' AS run_date
+SELECT t.*, '2026-05-31' AS run_date
 FROM (
     WITH daily_rollup AS (
         SELECT
-            event_dt,
+            CAST(event_dt AS DATE)          AS event_dt,
             subscriber_msisdn,
 
-            SUM(disbursement_amt)  AS loan_disb_amt_day,
-            SUM(repayment_amt)     AS loan_repaid_amt_day,
-            SUM(wallet_inflow_amt) AS wallet_inflow_amt_day,
-            SUM(wallet_outflow_amt) AS wallet_outflow_amt_day,
-            SUM(spend_amt)         AS spend_amt_day,
-            SUM(savings_amt)       AS savings_amt_day,
+            SUM(disbursement_amt)           AS loan_disb_amt_day,
+            SUM(repayment_amt)              AS loan_repaid_amt_day,
+            SUM(wallet_inflow_amt)          AS wallet_inflow_amt_day,
+            SUM(wallet_outflow_amt)         AS wallet_outflow_amt_day,
+            SUM(spend_amt)                  AS spend_amt_day,
+            SUM(savings_amt)                AS savings_amt_day,
 
             COUNT_IF(event_family = 'loan_disbursement') AS loan_disb_cnt_day,
             COUNT_IF(event_family = 'loan_repayment') AS loan_repay_cnt_day,
@@ -54,7 +57,6 @@ FROM (
         alt_credit_signal_flag_day
     FROM daily_rollup
 ) t
-WHERE t.event_dt = DATE 'YYYY-MM-DD'
 ;
 
 SET SESSION hive.insert_existing_partitions_behavior = 'APPEND';

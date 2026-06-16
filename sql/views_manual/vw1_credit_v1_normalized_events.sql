@@ -1,17 +1,18 @@
 -- Manual INSERT script for vw1_credit_v1_normalized_events.
 -- Run after deployment/pipeline_view_tables.sql has created the table.
 --
--- Step 1: Replace YYYY-MM-DD with the execution date (e.g. 2026-04-26).
--- Step 2: Run in Presto connected to hive.credit_engine.
--- Step 3: Run scripts in dependency order: vw1 → vw2 → vw3 → vw4 → vw5 → vw6.
+-- Loads 90 days of transaction history ending on 2026-05-31.
+-- vw3 rolling windows need data back to 2026-03-03 (90 days before 2026-05-31).
+-- All 90 days are loaded under a single run_date = '2026-05-31' partition.
+-- No outer date filter — the full range is inserted in one pass.
 --
--- The SET SESSION lines overwrite the existing partition for the date so
--- re-running the same date is safe (idempotent).
+-- Run scripts in dependency order: vw1 → vw2 → vw3 → vw4 → vw5 → vw6.
+-- The SET SESSION line overwrites the existing partition so re-running is safe.
 
 SET SESSION hive.insert_existing_partitions_behavior = 'OVERWRITE';
 
 INSERT INTO hive.credit_engine.vw1_credit_v1_normalized_events
-SELECT t.*, 'YYYY-MM-DD' AS run_date
+SELECT t.*, '2026-05-31' AS run_date
 FROM (
     WITH raw_base AS (
         SELECT
@@ -29,7 +30,7 @@ FROM (
             CAST(from_sp AS VARCHAR)       AS from_sp,
             CAST(to_sp AS VARCHAR)         AS to_sp
         FROM analytics.momo_tran_loc_mapping_v2
-        WHERE CAST(date_key AS VARCHAR) BETWEEN '20260401' AND '20260430'
+        WHERE CAST(date_key AS VARCHAR) BETWEEN '20260303' AND '20260531'
           AND NOT (
                 (service_name = 'Xtrafloat'               AND sub_service_name = 'Fee (Xtrafloat)')
              OR (service_name = 'Clinic Pesa'              AND sub_service_name = 'Revenue Share (Clinic Pesa)')
@@ -241,7 +242,6 @@ FROM (
     FROM base_events
     WHERE subscriber_msisdn IS NOT NULL
 ) t
-WHERE t.event_dt = DATE 'YYYY-MM-DD'
 ;
 
 SET SESSION hive.insert_existing_partitions_behavior = 'APPEND';
