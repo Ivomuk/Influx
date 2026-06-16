@@ -4,7 +4,8 @@
 -- Produces identical columns and the same eligibility logic.
 --
 -- SOURCES:
---   devdata.account_holder_dump                (subscriber registration — view)
+--   devdata.account_holder_dump                (subscriber registration — partitioned by tbl_dt)
+--   analytics.mobile_money_profiles            (subscriber profile filter)
 --   vw2_credit_v1_subscriber_day               (daily rollup — physical TABLE, May 2026)
 --   vw3_credit_v1_layer1_features              (30-day rolling features — physical TABLE, May 2026)
 --   wamujap.fm_momo_loan_portfolio_cummulation (loan portfolio)
@@ -19,9 +20,9 @@
 --     directly on (subscriber_msisdn, last_activity_dt) — a primary-key
 --     lookup. MAX(feature_dt) in vw3 = MAX(event_dt) in vw2 = last_activity_dt
 --     already computed in vw2_aggregated. Eliminates a double scan of vw3.
---   account_holder_dump (a view) pre-filtered to msisdns in vw2 before
---     the hash join is built — avoids loading the full subscriber base
---     into memory when only May transactors are needed.
+--   account_holder_dump filtered to tbl_dt = 20260531 (literal partition key)
+--     plus accountholder_status, account_status, and mobile_money_profiles —
+--     eliminates the full table scan that was the 22-minute bottleneck.
 --   loan portfolio table scanned 2× → replaced by a single
 --     loan_portfolio_base CTE; VARCHAR→DATE conversion and cooling_off_end_date
 --     computed once.
@@ -71,7 +72,7 @@ CREATE OR REPLACE VIEW vw_loan_eligibility_waterfall_v2 AS
 --   window_30d_start   DATE '2026-05-01'   first day of the analysis month
 --   window_90d_start   DATE '2026-05-01'   90-day lookback start (= 30d proxy while only 1 month loaded)
 --   run_date           '2026-05-31'        partition key for vw2 and vw3 (VARCHAR) ← literal in WHERE, not in CTE
---   tbl_dt             20260531            partition key for loan portfolio ← literal in WHERE, not in CTE
+--   tbl_dt             20260531            partition key for loan portfolio AND account_holder_dump ← literal in WHERE, not in CTE
 --
 -- WHY run_date and tbl_dt are NOT in the params CTE:
 --   Trino resolves partition keys at PLAN TIME from literal constants only.
@@ -86,12 +87,12 @@ WITH params AS (
 ),
 
 -- ── Rule 1: subscriber registration / activation dates ────────
--- Source: devdata.account_holder_dump (MOBILE MONEY, ACTIVE accounts only).
+-- Source: devdata.account_holder_dump (MOBILE MONEY, ACTIVE subscribers only).
+-- tbl_dt = 20260531 is a literal constant — Trino prunes to that partition at
+-- plan time, avoiding a full table scan. Both accountholder_status and
+-- account_status must be 'ACTIVE'; profile must be a known subscriber profile.
 -- registration_date and activation_date are VARCHAR YYYYMMDD (e.g. '20260501').
 -- Sub-select parses each date column once; outer SELECT aliases and derives.
--- Pre-filtered to msisdns present in vw2 — account_holder_dump is a view and
--- can be very large; filtering here prevents a full scan being built into the
--- hash join with vw2_aggregated.
 subscriber_reg AS (
     SELECT
         msisdn,
@@ -104,10 +105,11 @@ subscriber_reg AS (
             TRY(date_parse(registration_date, '%Y%m%d')) AS parsed_reg_dt,
             TRY(date_parse(activation_date,   '%Y%m%d')) AS parsed_act_dt
         FROM devdata.account_holder_dump
-        WHERE account_type   = 'MOBILE MONEY'
-          AND account_status = 'ACTIVE'
-          AND msisdn        != ''
-          AND msisdn IN (SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day WHERE run_date = '2026-05-31')
+        WHERE tbl_dt               = 20260531          -- literal partition key: Trino prunes at plan time
+          AND account_type         = 'MOBILE MONEY'
+          AND accountholder_status = 'ACTIVE'
+          AND account_status       = 'ACTIVE'
+          AND profile IN (SELECT profile_name FROM analytics.mobile_money_profiles WHERE subscriber_flag = true)
     )
 ),
 
