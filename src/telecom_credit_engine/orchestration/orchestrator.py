@@ -473,6 +473,8 @@ def run_batch_pipeline(
     outcome_config=None,
     fairness_config=None,
     explainability_config=None,
+    # Skip SQL materialisation when tables are already loaded (e.g. manual backfill)
+    skip_sql=False,
 ):
     """
     Runs the full daily batch pipeline in dependency order.
@@ -490,7 +492,14 @@ def run_batch_pipeline(
     # Step 1: SQL views
     from telecom_credit_engine.orchestration.batch_engine import PrestoSQLBatchEngine
     batch_engine = PrestoSQLBatchEngine(query_client)
-    layer1_df, layer0_df, vw5_df, vw6_df = run_sql_batch_pipeline(execution_date, batch_engine)
+    if skip_sql:
+        _log.info('skip_sql=True — reading pre-loaded tables for %s', execution_date)
+        layer1_df = batch_engine.read('vw3_credit_v1_layer1_features', execution_date)
+        layer0_df = batch_engine.read('vw4_credit_v1_layer0_scores',   execution_date)
+        vw5_df    = batch_engine.read('vw5_credit_v1_reason_codes',    execution_date)
+        vw6_df    = batch_engine.read('vw6_credit_v1_cap_and_action',  execution_date)
+    else:
+        layer1_df, layer0_df, vw5_df, vw6_df = run_sql_batch_pipeline(execution_date, batch_engine)
 
     # Step 2: Data contracts + QA gates
     run_sql_qa_gates(layer1_df, layer0_df, vw5_df, vw6_df)
