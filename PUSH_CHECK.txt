@@ -1,0 +1,3 @@
+Push capability check
+Date (UTC): 2026-04-25
+Result: Push attempt failed on branch 'work' because no remote push destination is configured.
