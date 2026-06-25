@@ -8,9 +8,6 @@
 
 import pandas as pd
 import numpy as np
-from tqdm import tqdm
-
-tqdm.pandas()
 
 # -----------------------------------------------------------------------
 # Configuration (loaded from Config.txt in production)
@@ -245,53 +242,71 @@ def evaluate_tnv_actions(policy_prefilter_input_df, action_specs_input_df, confi
     margin_mult = config_dict.get('tnv_future_margin_multiplier', 0.05)
     churn_mult = config_dict.get('tnv_churn_cost_multiplier', 0.03)
     treatment_scalar = config_dict.get('tnv_treatment_cost_scalar', 500.0)
-    action_rows = []
-    for _, sub_row in tqdm(policy_df.iterrows(), total=len(policy_df)):
-        base_capacity = max(
-            sub_row['wallet_inflow_amt_30d'] * base_cap_factor * sub_row['expected_repayment_probability_v1_rule'],
-            0.0
+    thin_file_cap = config_dict['thin_file_capacity_cap']
+
+    policy_df['_base_capacity'] = (
+        policy_df['wallet_inflow_amt_30d'] * base_cap_factor
+        * policy_df['expected_repayment_probability_v1_rule']
+    ).clip(lower=0.0)
+    thin = policy_df['thin_file_flag'] == 1
+    policy_df.loc[thin, '_base_capacity'] = policy_df.loc[thin, '_base_capacity'].clip(upper=thin_file_cap)
+
+    # Resolve validity_days_key → actual days before cross-join
+    specs = action_specs_input_df.copy()
+    specs['validity_days'] = specs['validity_days_key'].map(config_dict)
+    specs['allow_col'] = 'allow_' + specs['action'].str.lower()
+
+    frames = []
+    for _, spec in specs.iterrows():
+        allow_col = spec['allow_col']
+        if allow_col not in policy_df.columns:
+            continue
+        allowed = policy_df[policy_df[allow_col] == 1]
+        if allowed.empty:
+            continue
+
+        target_capacity_raw = allowed['_base_capacity'] * spec['capacity_multiplier']
+        immediate_lending_margin = target_capacity_raw * spec['base_margin_rate']
+        discounted_future_transaction_margin = (
+            allowed['expected_future_transaction_margin_score_v1_rule']
+            * allowed['wallet_inflow_amt_30d'] * margin_mult * spec['capacity_multiplier']
         )
-        if sub_row['thin_file_flag'] == 1:
-            base_capacity = min(base_capacity, config_dict['thin_file_capacity_cap'])
-        for _, spec in action_specs_input_df.iterrows():
-            allow_col = 'allow_' + spec['action'].lower()
-            if sub_row.get(allow_col, 0) != 1:
-                continue
-            target_capacity_raw = base_capacity * spec['capacity_multiplier']
-            immediate_lending_margin = target_capacity_raw * spec['base_margin_rate']
-            discounted_future_transaction_margin = (
-                sub_row['expected_future_transaction_margin_score_v1_rule']
-                * sub_row['wallet_inflow_amt_30d'] * margin_mult * spec['capacity_multiplier']
-            )
-            expected_credit_loss = target_capacity_raw * sub_row['expected_credit_loss_rate_v1_rule']
-            adjusted_churn_probability = max(
-                sub_row['churn_cooling_probability_v1_rule'] - spec['churn_relief'], 0.0
-            )
-            expected_churn_cost = adjusted_churn_probability * sub_row['wallet_inflow_amt_30d'] * churn_mult
-            expected_treatment_cost = sub_row['expected_treatment_cost_score_v1_rule'] * treatment_scalar * spec['treatment_multiplier']
-            expected_tnv = (
-                immediate_lending_margin + discounted_future_transaction_margin
-                - expected_credit_loss - expected_churn_cost - expected_treatment_cost
-            )
-            action_rows.append({
-                'feature_dt': sub_row['feature_dt'],
-                'subscriber_msisdn': sub_row['subscriber_msisdn'],
-                'primary_policy_reason': sub_row['primary_policy_reason'],
-                'action': spec['action'],
-                'target_capacity_raw': target_capacity_raw,
-                'immediate_lending_margin': immediate_lending_margin,
-                'discounted_future_transaction_margin': discounted_future_transaction_margin,
-                'expected_credit_loss': expected_credit_loss,
-                'expected_churn_cost': expected_churn_cost,
-                'expected_treatment_cost': expected_treatment_cost,
-                'expected_tnv': expected_tnv,
-                'stability_multiplier': spec['stability_multiplier'],
-                'update_direction': spec['update_direction'],
-                'validity_days': config_dict[spec['validity_days_key']],
-            })
-    output_df = pd.DataFrame(action_rows)
-    if output_df.empty:
+        expected_credit_loss = target_capacity_raw * allowed['expected_credit_loss_rate_v1_rule']
+        adjusted_churn_probability = (
+            allowed['churn_cooling_probability_v1_rule'] - spec['churn_relief']
+        ).clip(lower=0.0)
+        expected_churn_cost = adjusted_churn_probability * allowed['wallet_inflow_amt_30d'] * churn_mult
+        expected_treatment_cost = (
+            allowed['expected_treatment_cost_score_v1_rule'] * treatment_scalar * spec['treatment_multiplier']
+        )
+        expected_tnv = (
+            immediate_lending_margin + discounted_future_transaction_margin
+            - expected_credit_loss - expected_churn_cost - expected_treatment_cost
+        )
+
+        action_df = pd.DataFrame({
+            'feature_dt': allowed['feature_dt'].values,
+            'subscriber_msisdn': allowed['subscriber_msisdn'].values,
+            'primary_policy_reason': allowed['primary_policy_reason'].values,
+            'action': spec['action'],
+            'target_capacity_raw': target_capacity_raw.values,
+            'immediate_lending_margin': immediate_lending_margin.values,
+            'discounted_future_transaction_margin': discounted_future_transaction_margin.values,
+            'expected_credit_loss': expected_credit_loss.values,
+            'expected_churn_cost': expected_churn_cost.values,
+            'expected_treatment_cost': expected_treatment_cost.values,
+            'expected_tnv': expected_tnv.values,
+            'stability_multiplier': spec['stability_multiplier'],
+            'update_direction': spec['update_direction'],
+            'validity_days': spec['validity_days'],
+        })
+        frames.append(action_df)
+
+    policy_df.drop(columns=['_base_capacity'], inplace=True)
+
+    if not frames:
         raise ValueError('No feasible actions were generated in evaluate_tnv_actions')
+    output_df = pd.concat(frames, ignore_index=True)
     return output_df
 
 # -----------------------------------------------------------------------
