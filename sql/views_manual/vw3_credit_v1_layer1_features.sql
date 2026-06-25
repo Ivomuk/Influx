@@ -195,7 +195,7 @@ FROM (
             alt_credit_active_flag_30d,
 
             CASE WHEN active_lender_cnt_30d >= 2 THEN 1 ELSE 0 END AS stacked_borrowing_flag_30d,
-            CASE WHEN disbursement_cnt_30d  >= 3 THEN 1 ELSE 0 END AS repeated_borrowing_flag_30d,
+            CASE WHEN disbursement_cnt_30d  >= 6 THEN 1 ELSE 0 END AS repeated_borrowing_flag_30d,
 
             CASE
                 WHEN avg_daily_inflow_30d > 0

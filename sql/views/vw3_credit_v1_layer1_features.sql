@@ -451,7 +451,7 @@ final_features AS (
 
         -- Stacking and repeated borrowing flags
         CASE WHEN active_lender_cnt_30d >= 2 THEN 1 ELSE 0 END AS stacked_borrowing_flag_30d,
-        CASE WHEN disbursement_cnt_30d  >= 3 THEN 1 ELSE 0 END AS repeated_borrowing_flag_30d,
+        CASE WHEN disbursement_cnt_30d  >= 6 THEN 1 ELSE 0 END AS repeated_borrowing_flag_30d,
 
         -- Anti-gaming flags (Dimension 5)
         CASE

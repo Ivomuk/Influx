@@ -116,7 +116,7 @@ def build_policy_prefilter(decision_base_input_df, config_dict, vw5_reason_codes
     output_df['exposure_to_inflow_ratio'] = np.where(
         output_df['wallet_inflow_amt_30d'] > 0,
         output_df['outstanding_exposure_amt'] / output_df['wallet_inflow_amt_30d'],
-        999.0
+        np.where(output_df['outstanding_exposure_amt'] > 0, 999.0, 0.0)
     )
     output_df['thin_file_flag'] = (
         output_df['wallet_active_days_30d'] < config_dict['thin_file_wallet_days_threshold']
