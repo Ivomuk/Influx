@@ -167,6 +167,7 @@ def run_decision_engine_step(layer1_df, layer0_df, vw5_df, vw6_df,
         vw5_reason_codes_df=vw5_df,
         vw6_cap_action_df=vw6_df,
         circuit_breaker_multiplier=_circuit_breaker_multiplier,
+        prior_state_df=_prior_state_df,
     )
 
     # QA gate on decision engine outputs
@@ -269,7 +270,8 @@ def run_outcome_tracking_step(engine_outputs, layer0_df, layer1_df,
 # ---------------------------------------------------------------------------
 
 VALID_OPERATING_STATES = frozenset({
-    'healthy', 'at_risk', 'distressed', 'recovered', 'cooling', 'fraud_review',
+    'Healthy', 'At Risk', 'Distressed', 'Recovered', 'Cooling Off', 'Fraud Review',
+    'Restricted',
 })
 
 

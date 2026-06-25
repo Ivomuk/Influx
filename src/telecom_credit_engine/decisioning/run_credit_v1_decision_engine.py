@@ -44,6 +44,10 @@ DECISION_ENGINE_CONFIG = {
     'budget_priority_states': ['Healthy', 'Recovered'],
     'block_timing_manipulation': True,
     'block_loan_cycling': True,
+    'tnv_base_capacity_factor': 0.35,
+    'tnv_future_margin_multiplier': 0.05,
+    'tnv_churn_cost_multiplier': 0.03,
+    'tnv_treatment_cost_scalar': 500.0,
 }
 
 ACTION_SPECS_DF = pd.DataFrame([
@@ -237,10 +241,14 @@ def build_policy_prefilter(decision_base_input_df, config_dict, vw5_reason_codes
 
 def evaluate_tnv_actions(policy_prefilter_input_df, action_specs_input_df, config_dict):
     policy_df = policy_prefilter_input_df.copy()
+    base_cap_factor = config_dict.get('tnv_base_capacity_factor', 0.35)
+    margin_mult = config_dict.get('tnv_future_margin_multiplier', 0.05)
+    churn_mult = config_dict.get('tnv_churn_cost_multiplier', 0.03)
+    treatment_scalar = config_dict.get('tnv_treatment_cost_scalar', 500.0)
     action_rows = []
     for _, sub_row in tqdm(policy_df.iterrows(), total=len(policy_df)):
         base_capacity = max(
-            sub_row['wallet_inflow_amt_30d'] * 0.35 * sub_row['expected_repayment_probability_v1_rule'],
+            sub_row['wallet_inflow_amt_30d'] * base_cap_factor * sub_row['expected_repayment_probability_v1_rule'],
             0.0
         )
         if sub_row['thin_file_flag'] == 1:
@@ -253,14 +261,14 @@ def evaluate_tnv_actions(policy_prefilter_input_df, action_specs_input_df, confi
             immediate_lending_margin = target_capacity_raw * spec['base_margin_rate']
             discounted_future_transaction_margin = (
                 sub_row['expected_future_transaction_margin_score_v1_rule']
-                * sub_row['wallet_inflow_amt_30d'] * 0.05 * spec['capacity_multiplier']
+                * sub_row['wallet_inflow_amt_30d'] * margin_mult * spec['capacity_multiplier']
             )
             expected_credit_loss = target_capacity_raw * sub_row['expected_credit_loss_rate_v1_rule']
             adjusted_churn_probability = max(
                 sub_row['churn_cooling_probability_v1_rule'] - spec['churn_relief'], 0.0
             )
-            expected_churn_cost = adjusted_churn_probability * sub_row['wallet_inflow_amt_30d'] * 0.03
-            expected_treatment_cost = sub_row['expected_treatment_cost_score_v1_rule'] * 500.0 * spec['treatment_multiplier']
+            expected_churn_cost = adjusted_churn_probability * sub_row['wallet_inflow_amt_30d'] * churn_mult
+            expected_treatment_cost = sub_row['expected_treatment_cost_score_v1_rule'] * treatment_scalar * spec['treatment_multiplier']
             expected_tnv = (
                 immediate_lending_margin + discounted_future_transaction_margin
                 - expected_credit_loss - expected_churn_cost - expected_treatment_cost
@@ -291,7 +299,7 @@ def evaluate_tnv_actions(policy_prefilter_input_df, action_specs_input_df, confi
 # Dimension 4: stability smoothing + network budget constraint.
 # -----------------------------------------------------------------------
 
-def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_capacity_df=None, vw6_cap_action_df=None):
+def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_capacity_df=None, vw6_cap_action_df=None, prior_state_df=None):
     """
     Picks the best action per subscriber and applies:
       1. Policy cap (hard ceiling from config)
@@ -357,7 +365,15 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
         priority_states = config_dict.get('budget_priority_states', [])
 
         # Sort: priority subscribers first (by expected_tnv descending within each group).
-        best_df['_is_priority'] = best_df.get('operating_state', pd.Series('', index=best_df.index)).isin(priority_states).astype(int)
+        # Use prior_state_df (from the previous cycle) since current-cycle state
+        # is computed in Layers 5-8, which run after the decision engine.
+        if prior_state_df is not None and not prior_state_df.empty:
+            state_lookup = prior_state_df[['subscriber_msisdn', 'operating_state']].drop_duplicates('subscriber_msisdn')
+            best_df = best_df.merge(state_lookup, on='subscriber_msisdn', how='left')
+            best_df['operating_state'] = best_df['operating_state'].fillna('')
+        else:
+            best_df['operating_state'] = ''
+        best_df['_is_priority'] = best_df['operating_state'].isin(priority_states).astype(int)
         best_df = best_df.sort_values(['_is_priority', 'expected_tnv'], ascending=[False, False]).reset_index(drop=True)
 
         cumulative = best_df['target_capacity_stability_adjusted'].cumsum()
@@ -369,7 +385,7 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
             best_df.loc[first_over, 'target_capacity_stability_adjusted'] = remaining
             best_df.loc[first_over + 1:, 'target_capacity_stability_adjusted'] = 0.0
 
-        best_df = best_df.drop(columns=['_is_priority'])
+        best_df = best_df.drop(columns=['_is_priority', 'operating_state'], errors='ignore')
 
     best_df['CreditLimit'] = best_df['target_capacity_stability_adjusted'].round(0)
 
@@ -424,7 +440,8 @@ def run_credit_v1_decision_engine(
     previous_capacity_df=None,
     vw5_reason_codes_df=None,
     vw6_cap_action_df=None,
-    circuit_breaker_multiplier=1.0
+    circuit_breaker_multiplier=1.0,
+    prior_state_df=None
 ):
     """
     Runs the full Layer 2–4 decision engine.
@@ -455,7 +472,7 @@ def run_credit_v1_decision_engine(
     decision_base_df = prepare_decision_base(layer1_input_df, layer0_input_df)
     policy_prefilter_df = build_policy_prefilter(decision_base_df, local_config, vw5_reason_codes_df)
     tnv_actions_df = evaluate_tnv_actions(policy_prefilter_df, local_action_specs, local_config)
-    final_capacity_df = select_final_capacity_output(tnv_actions_df, local_config, previous_capacity_df, vw6_cap_action_df)
+    final_capacity_df = select_final_capacity_output(tnv_actions_df, local_config, previous_capacity_df, vw6_cap_action_df, prior_state_df)
 
     return {
         'decision_base_df': decision_base_df,

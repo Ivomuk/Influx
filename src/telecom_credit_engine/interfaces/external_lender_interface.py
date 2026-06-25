@@ -9,7 +9,7 @@ def build_external_lender_interface(final_capacity_df, include_optional_fields=T
     interface_df = final_capacity_df.copy()
     interface_df = interface_df.rename(columns={'subscriber_msisdn': 'MSISDN'})
     if decision_timestamp is None:
-        decision_timestamp_val = pd.Timestamp.utcnow().floor('s')
+        decision_timestamp_val = pd.Timestamp.now('UTC').floor('s')
     else:
         decision_timestamp_val = pd.to_datetime(decision_timestamp)
     if policy_version_col not in interface_df.columns:

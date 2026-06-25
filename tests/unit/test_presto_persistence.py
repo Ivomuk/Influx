@@ -327,7 +327,7 @@ def _patch_globals(**overrides):
         }),
         '_prior_state_df': pd.DataFrame({
             'subscriber_msisdn': ['256700000001'],
-            'operating_state': ['healthy'],
+            'operating_state': ['Healthy'],
             'state_change_dt': [pd.Timestamp('2026-04-01')],
         }),
         '_circuit_breaker_multiplier': 0.80,
@@ -485,7 +485,7 @@ def test_persist_raises_on_unknown_operating_state():
 def test_persist_accepts_all_valid_operating_states():
     """All six valid states must not raise."""
     import telecom_credit_engine.orchestration.orchestrator as orch
-    valid_states = ['healthy', 'at_risk', 'distressed', 'recovered', 'cooling', 'fraud_review']
+    valid_states = ['Healthy', 'At Risk', 'Distressed', 'Recovered', 'Cooling Off', 'Fraud Review']
     state_df = pd.DataFrame({
         'subscriber_msisdn': [f'256700000{i:03d}' for i in range(len(valid_states))],
         'operating_state': valid_states,
@@ -566,7 +566,7 @@ def test_load_restores_previous_capacity_df():
     import telecom_credit_engine.orchestration.orchestrator as orch
     qc = _make_load_client(
         cap_rows=[('256700000001', 10000.0)],
-        state_rows=[('256700000001', 'healthy', pd.Timestamp('2026-04-01'))],
+        state_rows=[('256700000001', 'Healthy', pd.Timestamp('2026-04-01'))],
         meta_rows=[(0.80, 'CONSERVATIVE')],
     )
     with patch.multiple(orch,
@@ -583,7 +583,7 @@ def test_load_restores_circuit_breaker_and_mode():
     import telecom_credit_engine.orchestration.orchestrator as orch
     qc = _make_load_client(
         cap_rows=[('256700000001', 10000.0)],
-        state_rows=[('256700000001', 'healthy', pd.Timestamp('2026-04-01'))],
+        state_rows=[('256700000001', 'Healthy', pd.Timestamp('2026-04-01'))],
         meta_rows=[(0.70, 'MANUAL_REVIEW_ONLY')],
     )
     with patch.multiple(orch,
@@ -633,7 +633,7 @@ def test_load_parses_state_change_dt_as_timestamp():
     import telecom_credit_engine.orchestration.orchestrator as orch
     qc = _make_load_client(
         cap_rows=[],
-        state_rows=[('256700000001', 'healthy', '2026-04-01 00:00:00')],
+        state_rows=[('256700000001', 'Healthy', '2026-04-01 00:00:00')],
         meta_rows=[],
     )
     with patch.multiple(orch,

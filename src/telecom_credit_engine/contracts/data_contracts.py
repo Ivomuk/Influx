@@ -28,39 +28,39 @@ LAYER1_FEATURES_CONTRACT = {
     'subscriber_msisdn':                  {'required': True,  'nullable': False},
     # Exposure
     'outstanding_exposure_amt':           {'required': True,  'nullable': False},
-    'active_lender_cnt_30d':              {'required': True,  'nullable': False},
-    'disbursement_cnt_30d':               {'required': True,  'nullable': False},
-    'days_since_last_disbursement':       {'required': True,  'nullable': True},
+    'active_lender_cnt_30d':              {'required': True,  'nullable': False, 'min': 0},
+    'disbursement_cnt_30d':               {'required': True,  'nullable': False, 'min': 0},
+    'days_since_last_disbursement':       {'required': True,  'nullable': True,  'min': 0},
     # Repayment
-    'repayment_ratio_30d':                {'required': True,  'nullable': True},
+    'repayment_ratio_30d':                {'required': True,  'nullable': True,  'min': 0},
     'repayment_ratio_trend_7d':           {'required': True,  'nullable': True},
     # Wallet
-    'wallet_inflow_amt_30d':              {'required': True,  'nullable': False},
-    'wallet_outflow_amt_30d':             {'required': True,  'nullable': False},
-    'spend_amt_30d':                      {'required': True,  'nullable': False},
-    'wallet_active_days_30d':             {'required': True,  'nullable': False},
+    'wallet_inflow_amt_30d':              {'required': True,  'nullable': False, 'min': 0},
+    'wallet_outflow_amt_30d':             {'required': True,  'nullable': False, 'min': 0},
+    'spend_amt_30d':                      {'required': True,  'nullable': False, 'min': 0},
+    'wallet_active_days_30d':             {'required': True,  'nullable': False, 'min': 0, 'max': 30},
     'wallet_inflow_trend_7d_vs_90d':      {'required': True,  'nullable': True},
     # Anti-gaming flags
-    'stacked_borrowing_flag_30d':         {'required': True,  'nullable': False},
-    'repeated_borrowing_flag_30d':        {'required': True,  'nullable': False},
-    'timing_manipulation_flag':           {'required': True,  'nullable': False},
-    'suspicious_repayment_jump_flag':     {'required': True,  'nullable': False},
-    'loan_cycling_flag':                  {'required': True,  'nullable': False},
+    'stacked_borrowing_flag_30d':         {'required': True,  'nullable': False, 'min': 0, 'max': 1},
+    'repeated_borrowing_flag_30d':        {'required': True,  'nullable': False, 'min': 0, 'max': 1},
+    'timing_manipulation_flag':           {'required': True,  'nullable': False, 'min': 0, 'max': 1},
+    'suspicious_repayment_jump_flag':     {'required': True,  'nullable': False, 'min': 0, 'max': 1},
+    'loan_cycling_flag':                  {'required': True,  'nullable': False, 'min': 0, 'max': 1},
 }
 
 LAYER0_SCORES_CONTRACT = {
     'feature_dt':                                          {'required': True,  'nullable': False},
     'subscriber_msisdn':                                   {'required': True,  'nullable': False},
-    'expected_repayment_probability_v1_rule':              {'required': True,  'nullable': False},
-    'expected_credit_loss_rate_v1_rule':                   {'required': True,  'nullable': False},
-    'churn_cooling_probability_v1_rule':                   {'required': True,  'nullable': False},
-    'expected_future_transaction_margin_score_v1_rule':    {'required': True,  'nullable': False},
-    'expected_treatment_cost_score_v1_rule':               {'required': True,  'nullable': False},
+    'expected_repayment_probability_v1_rule':              {'required': True,  'nullable': False, 'min': 0, 'max': 1},
+    'expected_credit_loss_rate_v1_rule':                   {'required': True,  'nullable': False, 'min': 0, 'max': 1},
+    'churn_cooling_probability_v1_rule':                   {'required': True,  'nullable': False, 'min': 0, 'max': 1},
+    'expected_future_transaction_margin_score_v1_rule':    {'required': True,  'nullable': False, 'min': 0, 'max': 1},
+    'expected_treatment_cost_score_v1_rule':               {'required': True,  'nullable': False, 'min': 0, 'max': 1},
     'customer_lifetime_value_contribution_v1_rule':        {'required': True,  'nullable': False},
-    'debt_stress_index_v1':                                {'required': True,  'nullable': False},
-    'fraud_abuse_risk_score_v1_rule':                      {'required': True,  'nullable': False},
-    'behavior_consistency_score_v1_rule':                  {'required': True,  'nullable': False},
-    'identity_confidence_score_v1_rule':                   {'required': True,  'nullable': False},
+    'debt_stress_index_v1':                                {'required': True,  'nullable': False, 'min': 0, 'max': 100},
+    'fraud_abuse_risk_score_v1_rule':                      {'required': True,  'nullable': False, 'min': 0, 'max': 1},
+    'behavior_consistency_score_v1_rule':                  {'required': True,  'nullable': False, 'min': 0, 'max': 1},
+    'identity_confidence_score_v1_rule':                   {'required': True,  'nullable': False, 'min': 0, 'max': 1},
 }
 
 VW5_REASON_CODES_CONTRACT = {
@@ -79,7 +79,7 @@ VW6_CAP_ACTION_CONTRACT = {
 FINAL_CAPACITY_CONTRACT = {
     'feature_dt':        {'required': True, 'nullable': False},
     'subscriber_msisdn': {'required': True, 'nullable': False},
-    'CreditLimit':       {'required': True, 'nullable': False},
+    'CreditLimit':       {'required': True, 'nullable': False, 'min': 0},
     'selected_action':   {'required': True, 'nullable': False},
     'decision_status':   {'required': True, 'nullable': False},
 }
@@ -122,6 +122,16 @@ def validate_dataframe_contract(df, contract_name, strict=True):
         if not spec['nullable'] and df[col].isna().any():
             null_count = int(df[col].isna().sum())
             violations.append(f'UNEXPECTED_NULLS: {col} ({null_count} null values)')
+
+        if 'min' in spec and pd.api.types.is_numeric_dtype(df[col]):
+            below = df[col].dropna().lt(spec['min'])
+            if below.any():
+                violations.append(f'RANGE_VIOLATION: {col} has {int(below.sum())} values below {spec["min"]}')
+
+        if 'max' in spec and pd.api.types.is_numeric_dtype(df[col]):
+            above = df[col].dropna().gt(spec['max'])
+            if above.any():
+                violations.append(f'RANGE_VIOLATION: {col} has {int(above.sum())} values above {spec["max"]}')
 
     for w in warnings:
         print(f'CONTRACT_WARNING [{contract_name}]: {w}')
