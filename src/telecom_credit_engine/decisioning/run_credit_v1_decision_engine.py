@@ -370,10 +370,17 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
     else:
         best_df['prev_credit_limit'] = 0.0
 
+    # Re-zero after stability smoothing: DECLINE/RESTRICT must never receive
+    # credit regardless of what the prior-cycle bounds would suggest.
+    non_lending = best_df['selected_action'].isin(['DECLINE', 'RESTRICT'])
+    best_df.loc[non_lending, 'target_capacity_stability_adjusted'] = 0.0
+
     # ------------------------------------------------------------------
     # Dimension 4: Network-wide budget constraint (optional).
-    # Subscribers in priority_states are funded first; others are throttled
-    # proportionally if total would exceed budget.
+    # Subscribers in priority_states are funded first (sorted by expected_tnv
+    # descending). Remaining budget funds non-priority subscribers sequentially;
+    # the first subscriber crossing the boundary receives partial funding,
+    # all subsequent subscribers are zeroed out.
     # ------------------------------------------------------------------
     if config_dict.get('budget_constraint_enabled', False):
         budget_total = config_dict.get('network_lending_budget_total', float('inf'))

@@ -320,6 +320,23 @@ def test_decision_status_three_values_covered(layer1_df, layer0_df, default_conf
     assert all(s in valid for s in vw9['decision_status'])
 
 
+def test_decline_zeroed_after_stability_smoothing():
+    """DECLINE must produce CreditLimit=0 even when prior limit would clip it up."""
+    tnv = _make_tnv_df('A', 'MAINTAIN', expected_tnv=-50.0, target_capacity_raw=10000.0)
+    prev = pd.DataFrame([{'subscriber_msisdn': 'A', 'CreditLimit': 10000.0}])
+    result = select_final_capacity_output(tnv, _cfg(stability_max_decrease_pct=0.40), previous_capacity_df=prev)
+    assert result.iloc[0]['selected_action'] == 'DECLINE'
+    assert result.iloc[0]['CreditLimit'] == 0
+
+
+def test_restrict_zeroed_after_stability_smoothing():
+    """RESTRICT must produce CreditLimit=0 even when prior limit would clip it up."""
+    tnv = _make_tnv_df('A', 'RESTRICT', expected_tnv=10.0, target_capacity_raw=0.0)
+    prev = pd.DataFrame([{'subscriber_msisdn': 'A', 'CreditLimit': 15000.0}])
+    result = select_final_capacity_output(tnv, _cfg(stability_max_decrease_pct=0.40), previous_capacity_df=prev)
+    assert result.iloc[0]['CreditLimit'] == 0
+
+
 def test_all_output_keys_present(engine_outputs):
     assert 'decision_base_df' in engine_outputs
     assert 'vw7_credit_v1_policy_prefilter' in engine_outputs
