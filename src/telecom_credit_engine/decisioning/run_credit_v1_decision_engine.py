@@ -205,9 +205,10 @@ def build_policy_prefilter(decision_base_input_df, config_dict, vw5_reason_codes
     output_df['primary_policy_reason'] = np.select(conditions, choices, default='PASS')
 
     # ------------------------------------------------------------------
-    # Multi-reason tracking (governance/QA/debugging)
-    # Build a boolean DataFrame from the conditions list and concatenate
-    # all matching reason labels per row, in priority order.
+    # Multi-reason tracking (internal diagnostic context).
+    # all_triggered_reasons is Python-derived from the conditions above.
+    # primary_policy_reason may be SQL-overridden by vw5 downstream —
+    # the two columns intentionally serve different purposes.
     # ------------------------------------------------------------------
     _reason_flags = pd.concat(
         [cond.rename(label) for cond, label in zip(conditions, choices)],
@@ -229,9 +230,15 @@ def build_policy_prefilter(decision_base_input_df, config_dict, vw5_reason_codes
 
     action_cols = ['allow_decline', 'allow_restrict', 'allow_reduce', 'allow_maintain', 'allow_increase_small', 'allow_increase_medium']
     action_names = ['DECLINE', 'RESTRICT', 'REDUCE', 'MAINTAIN', 'INCREASE_SMALL', 'INCREASE_MEDIUM']
-    output_df['feasible_action_set'] = output_df[action_cols].apply(
-        lambda row: ','.join([action_names[i] for i, v in enumerate(row) if v == 1]), axis=1
-    )
+    _action_parts = [np.where(output_df[col] == 1, name, '') for col, name in zip(action_cols, action_names)]
+    _action_joined = _action_parts[0]
+    for p in _action_parts[1:]:
+        _action_joined = np.where(
+            (_action_joined != '') & (p != ''),
+            np.char.add(np.char.add(_action_joined.astype(str), ','), p.astype(str)),
+            np.where(p != '', p, _action_joined),
+        )
+    output_df['feasible_action_set'] = _action_joined
 
     # ------------------------------------------------------------------
     # Wire vw5: use SQL-authoritative primary_reason_code where available.
@@ -486,6 +493,7 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
 
     best_df['output_version'] = config_dict['output_version']
     best_df['config_hash'] = config_dict.get('_config_hash', '')
+    best_df['policy_version'] = config_dict.get('policy_version', config_dict.get('output_version', ''))
     # Three-value status so downstream systems can distinguish:
     #   declined            — no credit granted (TNV ≤ 0 or first-time reject);
     #                         lender should not disburse
@@ -506,9 +514,39 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
         'decision_status', 'expected_tnv', 'target_capacity_raw', 'target_capacity_policy_capped',
         'target_capacity_stability_adjusted', 'prev_credit_limit', 'after_vw6_cap',
         'binding_cap', 'CreditLimit',
-        'update_direction', 'validity_days', 'output_version', 'config_hash'
+        'update_direction', 'validity_days', 'output_version', 'policy_version', 'config_hash'
     ]
     return best_df[[c for c in final_cols if c in best_df.columns]].copy()
+
+# -----------------------------------------------------------------------
+# Default config loader
+# -----------------------------------------------------------------------
+
+_DEFAULT_YAML_PATH = None
+
+def _load_default_config():
+    """Load the YAML policy config if available, otherwise fall back to
+    the in-code DECISION_ENGINE_CONFIG with a computed hash."""
+    from pathlib import Path
+    from telecom_credit_engine.config_loader import load_policy_config, compute_config_hash
+
+    global _DEFAULT_YAML_PATH
+    if _DEFAULT_YAML_PATH is None:
+        candidates = [
+            Path(__file__).resolve().parents[2] / 'configs' / 'credit_v1_policy_config.yaml',
+            Path('configs') / 'credit_v1_policy_config.yaml',
+        ]
+        for p in candidates:
+            if p.is_file():
+                _DEFAULT_YAML_PATH = str(p)
+                break
+
+    if _DEFAULT_YAML_PATH:
+        return load_policy_config(_DEFAULT_YAML_PATH)
+
+    fallback = DECISION_ENGINE_CONFIG.copy()
+    fallback['_config_hash'] = compute_config_hash(fallback)
+    return fallback
 
 # -----------------------------------------------------------------------
 # Orchestrator
@@ -536,7 +574,13 @@ def run_credit_v1_decision_engine(
     circuit_breaker_multiplier: float emitted by run_layers_5_to_8 portfolio
       monitor. Scales policy_capacity_cap before TNV evaluation. Default 1.0.
     """
-    local_config = DECISION_ENGINE_CONFIG.copy() if config_dict is None else config_dict.copy()
+    if config_dict is None:
+        local_config = _load_default_config()
+    else:
+        local_config = config_dict.copy()
+        if '_config_hash' not in local_config:
+            from telecom_credit_engine.config_loader import compute_config_hash
+            local_config['_config_hash'] = compute_config_hash(local_config)
     local_action_specs = ACTION_SPECS_DF.copy() if action_specs_input_df is None else action_specs_input_df.copy()
 
     # Apply portfolio circuit breaker to capacity cap before any evaluation.

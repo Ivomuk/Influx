@@ -82,14 +82,16 @@ def validate_lender_report(report_df, config):
     bad_date = val_df['event_date_parsed'].isnull()
     errors += np.where(bad_date, 'UNPARSEABLE_DATE;', '')
 
-    # Future-dated events
+    # Future-dated events (compared against UTC date; East Africa is UTC+3,
+    # so a same-day event submitted late local time will not false-positive).
     processing_date = pd.Timestamp.now('UTC').normalize().tz_localize(None)
     future_dated = val_df['event_date_parsed'].notna() & (val_df['event_date_parsed'] > processing_date)
     errors += np.where(future_dated, 'FUTURE_DATED_EVENT;', '')
 
-    # Duplicate disbursement in same batch (same lender_id, msisdn, event_date, event_amount)
+    # Duplicate disbursement in same batch. loan_id is included so that
+    # separate same-day loans for the same amount are not false-positived.
     is_disbursement = val_df['event_type'] == 'DISBURSEMENT'
-    dup_cols = ['lender_id', 'msisdn', 'event_date', 'event_amount_num']
+    dup_cols = ['lender_id', 'msisdn', 'loan_id', 'event_date', 'event_amount_num']
     dup_mask = val_df.duplicated(subset=dup_cols, keep='first') & is_disbursement
     errors += np.where(dup_mask, 'DUPLICATE_DISBURSEMENT_IN_BATCH;', '')
 
