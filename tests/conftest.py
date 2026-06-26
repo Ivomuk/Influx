@@ -121,7 +121,7 @@ def clear_feature_store():
 @pytest.fixture
 def lender_config():
     return {
-        'required_report_fields': ['msisdn', 'loan_id', 'lender_id', 'event_type', 'event_amount', 'event_date'],
+        'required_report_fields': ['idempotency_key', 'msisdn', 'loan_id', 'lender_id', 'event_type', 'event_amount', 'event_date'],
         'optional_report_fields': ['days_past_due', 'loan_status', 'loan_tenor_days', 'interest_amount'],
         'valid_event_types': ['DISBURSEMENT', 'REPAYMENT', 'DEFAULT', 'STATUS_CHANGE'],
         'valid_loan_statuses': ['ACTIVE', 'REPAID', 'DEFAULTED', 'RESTRUCTURED', 'WRITTEN_OFF'],
@@ -136,6 +136,7 @@ def lender_config():
 @pytest.fixture
 def minimal_valid_lender_report():
     return pd.DataFrame([{
+        'idempotency_key': 'LDR001-L001-DISB-20260401',
         'msisdn': '256700000001',
         'loan_id': 'L001',
         'lender_id': 'LDR001',

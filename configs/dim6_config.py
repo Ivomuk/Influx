@@ -6,7 +6,7 @@ import pandas as pd
 LENDER_FEEDBACK_CONFIG = {
     # Required fields every lender report row must contain.
     'required_report_fields': [
-        'msisdn', 'loan_id', 'lender_id', 'event_type', 'event_amount', 'event_date'
+        'idempotency_key', 'msisdn', 'loan_id', 'lender_id', 'event_type', 'event_amount', 'event_date'
     ],
     # Optional fields ingested when present.
     'optional_report_fields': [

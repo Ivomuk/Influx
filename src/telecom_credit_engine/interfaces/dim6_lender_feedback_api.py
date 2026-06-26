@@ -8,6 +8,26 @@ import numpy as np
 from datetime import datetime, timezone
 
 
+# ---------------------------------------------------------------------------
+# Idempotency registry — prevents duplicate event processing.
+# Production: replace with Redis SET or database table keyed on idempotency_key.
+# ---------------------------------------------------------------------------
+
+_idempotency_registry = set()
+
+
+def get_idempotency_registry():
+    return _idempotency_registry
+
+
+def clear_idempotency_registry():
+    _idempotency_registry.clear()
+
+
+def register_idempotency_keys(keys):
+    _idempotency_registry.update(keys)
+
+
 def validate_lender_report(report_df, config):
     """
     Validates an incoming lender report DataFrame against schema and business rules.
@@ -27,6 +47,11 @@ def validate_lender_report(report_df, config):
 
     val_df = report_df.copy()
     errors = pd.Series([''] * len(val_df), index=val_df.index, dtype=str)
+
+    # Null or blank idempotency_key (when column is present or required)
+    if 'idempotency_key' in val_df.columns:
+        null_idem = val_df['idempotency_key'].isnull() | (val_df['idempotency_key'].astype(str).str.strip() == '')
+        errors += np.where(null_idem, 'NULL_IDEMPOTENCY_KEY;', '')
 
     # Null or blank MSISDN
     null_msisdn = val_df['msisdn'].isnull() | (val_df['msisdn'].astype(str).str.strip() == '')
@@ -69,17 +94,32 @@ def ingest_lender_report(validated_report_df, config):
     """
     Normalises a validated lender report into a standard internal event format.
     Only rows where is_valid_flag == 1 are processed.
+    Rows with previously-seen idempotency_key values are silently dropped.
     Returns a clean events DataFrame with typed columns and signed_amount.
     """
+    empty_cols = [
+        'msisdn', 'loan_id', 'lender_id', 'event_type', 'event_date',
+        'event_amount', 'signed_amount',
+        'is_disbursement', 'is_repayment', 'is_default', 'is_status_change',
+        'ingested_at', 'report_version',
+    ]
+
     valid_df = validated_report_df[validated_report_df['is_valid_flag'] == 1].copy()
 
     if valid_df.empty:
-        return pd.DataFrame(columns=[
-            'msisdn', 'loan_id', 'lender_id', 'event_type', 'event_date',
-            'event_amount', 'signed_amount',
-            'is_disbursement', 'is_repayment', 'is_default', 'is_status_change',
-            'ingested_at', 'report_version'
-        ])
+        return pd.DataFrame(columns=empty_cols)
+
+    # Idempotency: drop rows whose key was already processed.
+    if 'idempotency_key' in valid_df.columns:
+        registry = get_idempotency_registry()
+        already_seen = valid_df['idempotency_key'].isin(registry)
+        dup_count = int(already_seen.sum())
+        if dup_count > 0:
+            print(f'IDEMPOTENCY: {dup_count} duplicate event(s) dropped.')
+        valid_df = valid_df[~already_seen].copy()
+        if valid_df.empty:
+            return pd.DataFrame(columns=empty_cols)
+        register_idempotency_keys(valid_df['idempotency_key'].tolist())
 
     valid_df['is_disbursement'] = (valid_df['event_type'] == 'DISBURSEMENT').astype(int)
     valid_df['is_repayment'] = (valid_df['event_type'] == 'REPAYMENT').astype(int)
@@ -96,15 +136,19 @@ def ingest_lender_report(validated_report_df, config):
     valid_df['ingested_at'] = datetime.now(timezone.utc).replace(microsecond=0)
     valid_df['report_version'] = config['output_version']
 
-    return valid_df.rename(columns={
-        'event_date_parsed': 'event_date',
-        'event_amount_num': 'event_amount'
-    })[[
+    output_cols = [
         'msisdn', 'loan_id', 'lender_id', 'event_type', 'event_date',
         'event_amount', 'signed_amount',
         'is_disbursement', 'is_repayment', 'is_default', 'is_status_change',
-        'ingested_at', 'report_version'
-    ]].copy()
+        'ingested_at', 'report_version',
+    ]
+    valid_df = valid_df.rename(columns={
+        'event_date_parsed': 'event_date',
+        'event_amount_num': 'event_amount',
+    })
+    if 'idempotency_key' in valid_df.columns:
+        output_cols.append('idempotency_key')
+    return valid_df[output_cols].copy()
 
 
 def reconcile_lender_vs_observed(ingested_report_df, observed_events_df, config):
