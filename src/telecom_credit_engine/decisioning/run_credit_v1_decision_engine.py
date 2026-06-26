@@ -204,6 +204,29 @@ def build_policy_prefilter(decision_base_input_df, config_dict, vw5_reason_codes
     ]
     output_df['primary_policy_reason'] = np.select(conditions, choices, default='PASS')
 
+    # ------------------------------------------------------------------
+    # Multi-reason tracking (governance/QA/debugging)
+    # Build a boolean DataFrame from the conditions list and concatenate
+    # all matching reason labels per row, in priority order.
+    # ------------------------------------------------------------------
+    _reason_flags = pd.concat(
+        [cond.rename(label) for cond, label in zip(conditions, choices)],
+        axis=1,
+    )
+    output_df['triggered_reason_count'] = _reason_flags.sum(axis=1).astype(int)
+    # Vectorized multi-reason concatenation — avoids row-wise .apply on 4.5M rows.
+    _parts = [np.where(_reason_flags[label], label, '') for label in choices]
+    _joined = _parts[0]
+    for p in _parts[1:]:
+        _joined = np.where(
+            (_joined != '') & (p != ''),
+            np.char.add(np.char.add(_joined.astype(str), ';'), p.astype(str)),
+            np.where(p != '', p, _joined),
+        )
+    output_df['all_triggered_reasons'] = np.where(
+        output_df['triggered_reason_count'] > 0, _joined, 'PASS'
+    )
+
     action_cols = ['allow_decline', 'allow_restrict', 'allow_reduce', 'allow_maintain', 'allow_increase_small', 'allow_increase_medium']
     action_names = ['DECLINE', 'RESTRICT', 'REDUCE', 'MAINTAIN', 'INCREASE_SMALL', 'INCREASE_MEDIUM']
     output_df['feasible_action_set'] = output_df[action_cols].apply(
@@ -331,9 +354,21 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
     best_df = ranked_df.groupby(['feature_dt', 'subscriber_msisdn'], as_index=False).head(1).copy()
 
     best_df['selected_action'] = np.where(best_df['expected_tnv'] > 0, best_df['action'], 'DECLINE')
+
+    # ------------------------------------------------------------------
+    # Audit: initialise binding_cap — tracks which constraint actually bound.
+    # ------------------------------------------------------------------
+    best_df['binding_cap'] = 'UNCONSTRAINED'
+
     best_df['target_capacity_policy_capped'] = best_df['target_capacity_raw'].clip(
         lower=0.0, upper=config_dict['policy_capacity_cap']
     )
+    # Track where policy cap actually bound
+    best_df.loc[
+        best_df['target_capacity_raw'] > config_dict['policy_capacity_cap'],
+        'binding_cap'
+    ] = 'POLICY_CAP'
+
     best_df['target_capacity_stability_adjusted'] = np.where(
         best_df['selected_action'] == 'DECLINE',
         0.0,
@@ -362,11 +397,21 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
         has_prior = best_df['prev_credit_limit'] > 0
         proposed = best_df['target_capacity_stability_adjusted']
 
-        best_df['target_capacity_stability_adjusted'] = np.where(
+        smoothed = np.where(
             has_prior,
             proposed.clip(lower=lower_bound, upper=upper_bound),
             proposed
         )
+        # Track where stability smoothing bound the value
+        best_df.loc[
+            has_prior & (proposed > upper_bound),
+            'binding_cap'
+        ] = 'STABILITY_UPPER'
+        best_df.loc[
+            has_prior & (proposed < lower_bound),
+            'binding_cap'
+        ] = 'STABILITY_LOWER'
+        best_df['target_capacity_stability_adjusted'] = smoothed
     else:
         best_df['prev_credit_limit'] = 0.0
 
@@ -374,6 +419,8 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
     # credit regardless of what the prior-cycle bounds would suggest.
     non_lending = best_df['selected_action'].isin(['DECLINE', 'RESTRICT'])
     best_df.loc[non_lending, 'target_capacity_stability_adjusted'] = 0.0
+    best_df.loc[best_df['selected_action'] == 'DECLINE', 'binding_cap'] = 'TNV_NEGATIVE'
+    best_df.loc[best_df['selected_action'] == 'RESTRICT', 'binding_cap'] = 'RESTRICT'
 
     # ------------------------------------------------------------------
     # Dimension 4: Network-wide budget constraint (optional).
@@ -398,6 +445,7 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
         best_df['_is_priority'] = best_df['operating_state'].isin(priority_states).astype(int)
         best_df = best_df.sort_values(['_is_priority', 'expected_tnv'], ascending=[False, False]).reset_index(drop=True)
 
+        _pre_budget = best_df['target_capacity_stability_adjusted'].copy()
         cumulative = best_df['target_capacity_stability_adjusted'].cumsum()
         within_budget = cumulative <= budget_total
         # Partially fund the first subscriber that crosses the budget boundary.
@@ -406,6 +454,9 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
             remaining = max(budget_total - (cumulative.iloc[first_over - 1] if first_over > 0 else 0), 0.0)
             best_df.loc[first_over, 'target_capacity_stability_adjusted'] = remaining
             best_df.loc[first_over + 1:, 'target_capacity_stability_adjusted'] = 0.0
+        # Track where budget constraint changed the value
+        _budget_changed = best_df['target_capacity_stability_adjusted'] != _pre_budget
+        best_df.loc[_budget_changed, 'binding_cap'] = 'BUDGET_CONSTRAINT'
 
         best_df = best_df.drop(columns=['_is_priority', 'operating_state'], errors='ignore')
 
@@ -416,19 +467,25 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
     # conservative_credit_limit_v1 is a hard ceiling — the TNV optimiser
     # cannot exceed what the SQL view deemed safe for that subscriber.
     # ------------------------------------------------------------------
+    best_df['after_vw6_cap'] = best_df['CreditLimit'].copy()
     if vw6_cap_action_df is not None and not vw6_cap_action_df.empty:
         vw6_clean = vw6_cap_action_df[['feature_dt', 'subscriber_msisdn', 'conservative_credit_limit_v1']].copy()
         vw6_clean['feature_dt'] = pd.to_datetime(vw6_clean['feature_dt'])
         best_df = best_df.merge(vw6_clean, on=['feature_dt', 'subscriber_msisdn'], how='left')
         has_vw6_cap = best_df['conservative_credit_limit_v1'].notna()
+        _pre_vw6 = best_df['CreditLimit'].copy()
         best_df['CreditLimit'] = np.where(
             has_vw6_cap,
             np.minimum(best_df['CreditLimit'], best_df['conservative_credit_limit_v1']),
             best_df['CreditLimit']
         )
+        best_df['after_vw6_cap'] = best_df['CreditLimit'].copy()
+        # Track where vw6 cap actually changed the value
+        best_df.loc[best_df['CreditLimit'] < _pre_vw6, 'binding_cap'] = 'VW6_CAP'
         best_df = best_df.drop(columns=['conservative_credit_limit_v1'])
 
     best_df['output_version'] = config_dict['output_version']
+    best_df['config_hash'] = config_dict.get('_config_hash', '')
     # Three-value status so downstream systems can distinguish:
     #   declined            — no credit granted (TNV ≤ 0 or first-time reject);
     #                         lender should not disburse
@@ -447,8 +504,9 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
     final_cols = [
         'feature_dt', 'subscriber_msisdn', 'primary_policy_reason', 'selected_action',
         'decision_status', 'expected_tnv', 'target_capacity_raw', 'target_capacity_policy_capped',
-        'target_capacity_stability_adjusted', 'prev_credit_limit', 'CreditLimit',
-        'update_direction', 'validity_days', 'output_version'
+        'target_capacity_stability_adjusted', 'prev_credit_limit', 'after_vw6_cap',
+        'binding_cap', 'CreditLimit',
+        'update_direction', 'validity_days', 'output_version', 'config_hash'
     ]
     return best_df[[c for c in final_cols if c in best_df.columns]].copy()
 

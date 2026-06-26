@@ -342,3 +342,78 @@ def test_all_output_keys_present(engine_outputs):
     assert 'vw7_credit_v1_policy_prefilter' in engine_outputs
     assert 'vw8_credit_v1_tnv_action_evaluation' in engine_outputs
     assert 'vw9_credit_v1_final_capacity_output' in engine_outputs
+
+
+# ---------------------------------------------------------------------------
+# Multi-reason tracking (all_triggered_reasons / triggered_reason_count)
+# ---------------------------------------------------------------------------
+
+def test_all_triggered_reasons_multiple_flags():
+    """Subscriber with both high fraud AND severe DSI should have both in all_triggered_reasons."""
+    base = _base(
+        l0_overrides={
+            'fraud_abuse_risk_score_v1_rule': 0.90,
+            'debt_stress_index_v1': 90.0,
+        },
+    )
+    pf = build_policy_prefilter(base, _cfg())
+    reasons = pf.iloc[0]['all_triggered_reasons']
+    assert 'HIGH_FRAUD_ABUSE_RISK' in reasons
+    assert 'SEVERE_DSI' in reasons
+    assert reasons.count(';') >= 1
+    assert pf.iloc[0]['triggered_reason_count'] >= 2
+
+
+def test_all_triggered_reasons_single_flag():
+    """Only one reason fires — all_triggered_reasons should be that single reason."""
+    base = _base(l0_overrides={'fraud_abuse_risk_score_v1_rule': 0.90})
+    pf = build_policy_prefilter(base, _cfg())
+    reasons = pf.iloc[0]['all_triggered_reasons']
+    assert reasons == 'HIGH_FRAUD_ABUSE_RISK'
+    assert pf.iloc[0]['triggered_reason_count'] == 1
+
+
+def test_all_triggered_reasons_pass():
+    """Healthy subscriber — all_triggered_reasons should be PASS."""
+    base = _base()
+    pf = build_policy_prefilter(base, _cfg())
+    assert pf.iloc[0]['all_triggered_reasons'] == 'PASS'
+    assert pf.iloc[0]['triggered_reason_count'] == 0
+
+
+# ---------------------------------------------------------------------------
+# Final-capacity audit columns (binding_cap / after_vw6_cap)
+# ---------------------------------------------------------------------------
+
+def test_binding_cap_tnv_negative():
+    """DECLINE subscriber shows TNV_NEGATIVE."""
+    tnv = _make_tnv_df('A', 'MAINTAIN', expected_tnv=-50.0)
+    result = select_final_capacity_output(tnv, _cfg())
+    assert result.iloc[0]['binding_cap'] == 'TNV_NEGATIVE'
+
+
+def test_binding_cap_policy_cap():
+    """Raw capacity > policy cap → binding_cap = POLICY_CAP."""
+    tnv = _make_tnv_df('A', 'INCREASE_MEDIUM', expected_tnv=3000.0, target_capacity_raw=30000.0)
+    result = select_final_capacity_output(tnv, _cfg(policy_capacity_cap=20000.0))
+    assert result.iloc[0]['binding_cap'] == 'POLICY_CAP'
+
+
+def test_binding_cap_vw6():
+    """vw6 cap binds below policy cap → binding_cap = VW6_CAP."""
+    tnv = _make_tnv_df('A', 'INCREASE_MEDIUM', expected_tnv=3000.0, target_capacity_raw=18000.0)
+    vw6 = pd.DataFrame([{
+        'feature_dt': pd.Timestamp('2026-04-01'),
+        'subscriber_msisdn': 'A',
+        'conservative_credit_limit_v1': 5000.0,
+        'recommended_action': 'MAINTAIN',
+    }])
+    result = select_final_capacity_output(tnv, _cfg(), vw6_cap_action_df=vw6)
+    assert result.iloc[0]['binding_cap'] == 'VW6_CAP'
+
+
+def test_binding_cap_unconstrained():
+    """No cap binds — binding_cap = UNCONSTRAINED."""
+    tnv = _make_tnv_df('A', 'MAINTAIN', expected_tnv=100.0, target_capacity_raw=5000.0)
+    result = select_final_capacity_output(tnv, _cfg(policy_capacity_cap=20000.0))
+    assert result.iloc[0]['binding_cap'] == 'UNCONSTRAINED'

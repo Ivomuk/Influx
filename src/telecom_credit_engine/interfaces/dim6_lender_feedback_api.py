@@ -82,6 +82,24 @@ def validate_lender_report(report_df, config):
     bad_date = val_df['event_date_parsed'].isnull()
     errors += np.where(bad_date, 'UNPARSEABLE_DATE;', '')
 
+    # Future-dated events
+    processing_date = pd.Timestamp.now('UTC').normalize().tz_localize(None)
+    future_dated = val_df['event_date_parsed'].notna() & (val_df['event_date_parsed'] > processing_date)
+    errors += np.where(future_dated, 'FUTURE_DATED_EVENT;', '')
+
+    # Duplicate disbursement in same batch (same lender_id, msisdn, event_date, event_amount)
+    is_disbursement = val_df['event_type'] == 'DISBURSEMENT'
+    dup_cols = ['lender_id', 'msisdn', 'event_date', 'event_amount_num']
+    dup_mask = val_df.duplicated(subset=dup_cols, keep='first') & is_disbursement
+    errors += np.where(dup_mask, 'DUPLICATE_DISBURSEMENT_IN_BATCH;', '')
+
+    # Invalid amount precision (more than 2 decimal places)
+    amt_valid = val_df['event_amount_num'].notna()
+    precision_bad = amt_valid & (
+        (val_df['event_amount_num'] * 100).round(6) % 1 > 1e-9
+    )
+    errors += np.where(precision_bad, 'INVALID_AMOUNT_PRECISION;', '')
+
     val_df['validation_error_summary'] = errors.str.rstrip(';')
     val_df['is_valid_flag'] = (val_df['validation_error_summary'] == '').astype(int)
 
@@ -283,6 +301,76 @@ def detect_lender_noncompliance(ingested_report_df, final_capacity_df, config):
     return noncompliant_df
 
 
+def flag_repayment_exceeds_exposure(ingested_df, current_exposure_df):
+    """
+    Flags repayment events where abs(signed_amount) exceeds outstanding_exposure_amt
+    by more than 5%.  This is a WARNING (not a rejection) because exposure data may
+    be stale.
+
+    Returns a DataFrame of flagged rows with a 'warning_code' column, or an empty
+    DataFrame if nothing is flagged.
+    """
+    # Deduplicate columns that may appear after rename in ingest_lender_report
+    work_df = ingested_df.loc[:, ~ingested_df.columns.duplicated(keep='last')].copy()
+
+    repay_df = work_df[work_df['is_repayment'] == 1].copy()
+    if repay_df.empty:
+        return pd.DataFrame()
+
+    merged = repay_df.merge(
+        current_exposure_df[['msisdn', 'outstanding_exposure_amt']],
+        on='msisdn',
+        how='left',
+    )
+    merged['outstanding_exposure_amt'] = merged['outstanding_exposure_amt'].fillna(0.0)
+    exceeds = merged['signed_amount'].abs() > merged['outstanding_exposure_amt'] * 1.05
+    flagged = merged[exceeds].copy()
+    if flagged.empty:
+        return pd.DataFrame()
+    flagged['warning_code'] = 'REPAYMENT_EXCEEDS_EXPOSURE'
+    return flagged
+
+
+def flag_impossible_event_ordering(ingested_df):
+    """
+    Flags repayment events whose event_date is before the earliest disbursement
+    event_date for the same (msisdn, loan_id).  This is a WARNING, not a rejection.
+
+    Returns a DataFrame of flagged rows with a 'warning_code' column, or an empty
+    DataFrame if nothing is flagged.
+    """
+    if ingested_df.empty:
+        return pd.DataFrame()
+
+    # Deduplicate columns that may appear after rename in ingest_lender_report
+    work_df = ingested_df.loc[:, ~ingested_df.columns.duplicated(keep='last')].copy()
+
+    disb = work_df[work_df['is_disbursement'] == 1].copy()
+    repay = work_df[work_df['is_repayment'] == 1].copy()
+    if disb.empty or repay.empty:
+        return pd.DataFrame()
+
+    # Ensure event_date is datetime for comparison
+    disb['event_date'] = pd.to_datetime(disb['event_date'], errors='coerce')
+    repay['event_date'] = pd.to_datetime(repay['event_date'], errors='coerce')
+
+    earliest_disb = (
+        disb.groupby(['msisdn', 'loan_id'], as_index=False)['event_date']
+        .min()
+        .rename(columns={'event_date': 'earliest_disbursement_date'})
+    )
+
+    merged = repay.merge(earliest_disb, on=['msisdn', 'loan_id'], how='left')
+    bad_order = merged['earliest_disbursement_date'].notna() & (
+        merged['event_date'] < merged['earliest_disbursement_date']
+    )
+    flagged = merged[bad_order].copy()
+    if flagged.empty:
+        return pd.DataFrame()
+    flagged['warning_code'] = 'REPAYMENT_BEFORE_DISBURSEMENT'
+    return flagged
+
+
 def run_lender_feedback_pipeline(raw_report_df, observed_events_df, current_exposure_df,
                                   final_capacity_df, config=None):
     """
@@ -306,6 +394,16 @@ def run_lender_feedback_pipeline(raw_report_df, observed_events_df, current_expo
     )
     noncompliance_df = detect_lender_noncompliance(ingested_df, final_capacity_df, local_config)
 
+    # Post-ingestion warnings
+    warning_frames = []
+    repay_warn_df = flag_repayment_exceeds_exposure(ingested_df, current_exposure_df)
+    if not repay_warn_df.empty:
+        warning_frames.append(repay_warn_df)
+    ordering_warn_df = flag_impossible_event_ordering(ingested_df)
+    if not ordering_warn_df.empty:
+        warning_frames.append(ordering_warn_df)
+    warnings_df = pd.concat(warning_frames, ignore_index=True) if warning_frames else pd.DataFrame()
+
     invalid_count = int((validated_df['is_valid_flag'] == 0).sum())
     if invalid_count > 0:
         print(f'WARNING: {invalid_count} lender report rows failed validation and were not ingested.')
@@ -315,11 +413,15 @@ def run_lender_feedback_pipeline(raw_report_df, observed_events_df, current_expo
         print(f'ALERT: {len(noncompliance_df)} lender non-compliance events detected.')
         print(noncompliance_df[['msisdn', 'lender_id', 'noncompliance_reason']])
 
+    if not warnings_df.empty:
+        print(f'WARNINGS: {len(warnings_df)} post-ingestion warning(s) raised.')
+
     return {
         'validated_df': validated_df,
         'ingested_df': ingested_df,
         'reconciliation_detail_df': reconciliation_detail_df,
         'reconciliation_summary_df': reconciliation_summary_df,
         'updated_exposure_df': updated_exposure_df,
-        'noncompliance_df': noncompliance_df
+        'noncompliance_df': noncompliance_df,
+        'warnings_df': warnings_df
     }

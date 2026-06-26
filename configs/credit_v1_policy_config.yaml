@@ -1,0 +1,67 @@
+# Credit V1 Decision Engine Policy Configuration
+# ------------------------------------------------
+# This file is the single source of truth for all decision-engine
+# thresholds.  Every production decision row carries the SHA-256 hash
+# of the config that produced it (config_hash column).
+
+policy_version: "credit_v1_policy_2026-06-26"
+
+# --- Identity & Fraud ---
+identity_and_fraud:
+  identity_confidence_restrict_threshold: 0.70
+  fraud_restrict_threshold: 0.80
+
+# --- Debt Stress Index (DSI) ---
+dsi:
+  severe_dsi_threshold: 85.0
+  reduce_only_dsi_min: 60.0
+  reduce_only_dsi_max: 84.0
+  maintain_only_dsi_min: 40.0
+  maintain_only_dsi_max: 59.0
+
+# --- Policy caps & validity windows ---
+policy_caps:
+  recent_disb_days_threshold: 3
+  recent_disb_repayment_threshold: 0.10
+  low_repayment_ratio_threshold: 0.50
+  high_exposure_to_inflow_threshold: 0.80
+  high_active_lender_cnt_threshold: 3
+  policy_capacity_cap: 20000.0
+  validity_days_restrict: 7
+  validity_days_reduce: 14
+  validity_days_maintain: 14
+  validity_days_increase: 7
+
+# --- Stability smoothing (Dimension 4) ---
+stability_smoothing:
+  stability_max_increase_pct: 0.25
+  stability_max_decrease_pct: 0.40
+  stability_restrict_cooldown_days: 14
+
+# --- Budget constraint (Dimension 4) ---
+budget_constraint:
+  budget_constraint_enabled: false
+  network_lending_budget_total: 50000000.0
+  budget_priority_states:
+    - Healthy
+    - Recovered
+
+# --- TNV coefficients ---
+tnv_coefficients:
+  tnv_base_capacity_factor: 0.35
+  tnv_future_margin_multiplier: 0.05
+  tnv_churn_cost_multiplier: 0.03
+  tnv_treatment_cost_scalar: 500.0
+
+# --- Thin-file settings ---
+thin_file:
+  thin_file_wallet_days_threshold: 5
+  thin_file_capacity_cap: 5000.0
+
+# --- Anti-gaming policy blocks ---
+anti_gaming:
+  block_timing_manipulation: true
+  block_loan_cycling: true
+
+# --- Output version tag ---
+output_version: "credit_v1_python_decision_engine_prod"
