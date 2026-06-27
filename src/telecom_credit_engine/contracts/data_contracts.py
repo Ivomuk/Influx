@@ -77,11 +77,16 @@ VW6_CAP_ACTION_CONTRACT = {
 }
 
 FINAL_CAPACITY_CONTRACT = {
-    'feature_dt':        {'required': True, 'nullable': False},
-    'subscriber_msisdn': {'required': True, 'nullable': False},
-    'CreditLimit':       {'required': True, 'nullable': False, 'min': 0},
-    'selected_action':   {'required': True, 'nullable': False},
-    'decision_status':   {'required': True, 'nullable': False},
+    'feature_dt':            {'required': True, 'nullable': False},
+    'subscriber_msisdn':     {'required': True, 'nullable': False},
+    'CreditLimit':           {'required': True, 'nullable': False, 'min': 0},
+    'selected_action':       {'required': True, 'nullable': False},
+    'decision_status':       {'required': True, 'nullable': False},
+    'binding_cap':           {'required': True, 'nullable': False},
+    'config_hash':           {'required': True, 'nullable': False},
+    'policy_version':        {'required': True, 'nullable': False},
+    'all_triggered_reasons': {'required': True, 'nullable': False},
+    'after_vw6_cap':         {'required': True, 'nullable': False, 'min': 0},
 }
 
 CONTRACTS = {

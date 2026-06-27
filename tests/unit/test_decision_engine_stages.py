@@ -417,3 +417,33 @@ def test_binding_cap_unconstrained():
     tnv = _make_tnv_df('A', 'MAINTAIN', expected_tnv=100.0, target_capacity_raw=5000.0)
     result = select_final_capacity_output(tnv, _cfg(policy_capacity_cap=20000.0))
     assert result.iloc[0]['binding_cap'] == 'UNCONSTRAINED'
+
+def test_binding_cap_stability_upper():
+    """Stability smoothing upper bound is binding when raw capacity far exceeds prior limit."""
+    tnv = _make_tnv_df('A', 'INCREASE_MEDIUM', expected_tnv=3000.0, target_capacity_raw=30000.0)
+    prev = pd.DataFrame([{'subscriber_msisdn': 'A', 'CreditLimit': 10000.0}])
+    result = select_final_capacity_output(tnv, _cfg(stability_max_increase_pct=0.25), previous_capacity_df=prev)
+    assert result.iloc[0]['binding_cap'] == 'STABILITY_UPPER'
+
+
+def test_binding_cap_stability_lower():
+    """Stability smoothing lower bound is binding when proposed capacity far below prior limit."""
+    tnv = _make_tnv_df('A', 'REDUCE', expected_tnv=100.0, target_capacity_raw=1000.0)
+    # stability_multiplier defaults to 1.0 in _make_tnv_df, so proposed = 1000 * 1.0 = 1000
+    # lower_bound = 10000 * (1 - 0.40) = 6000; 1000 < 6000 → clipped to 6000
+    prev = pd.DataFrame([{'subscriber_msisdn': 'A', 'CreditLimit': 10000.0}])
+    result = select_final_capacity_output(tnv, _cfg(stability_max_decrease_pct=0.40), previous_capacity_df=prev)
+    assert result.iloc[0]['binding_cap'] == 'STABILITY_LOWER'
+
+
+def test_binding_cap_budget_constraint():
+    """Budget constraint zeroes out lower-priority subscribers when budget is exhausted."""
+    tnv = pd.concat([
+        _make_tnv_df('A', 'MAINTAIN', expected_tnv=200.0, target_capacity_raw=4000.0),
+        _make_tnv_df('B', 'MAINTAIN', expected_tnv=100.0, target_capacity_raw=4000.0),
+    ], ignore_index=True)
+    cfg = _cfg(budget_constraint_enabled=True, network_lending_budget_total=4000.0)
+    result = select_final_capacity_output(tnv, cfg)
+    b_row = result[result['subscriber_msisdn'] == 'B'].iloc[0]
+    assert b_row['binding_cap'] == 'BUDGET_CONSTRAINT'
+    assert b_row['CreditLimit'] == 0

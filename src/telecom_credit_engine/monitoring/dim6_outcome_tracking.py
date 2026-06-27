@@ -17,12 +17,16 @@ def store_decision_snapshot(final_capacity_df, layer0_df, layer1_df, config):
     This record is the ground truth for future calibration and model training.
     Stored columns: decision outputs + all Layer 0 scores + key Layer 1 features.
     """
+    _snapshot_cols = [
+        'feature_dt', 'subscriber_msisdn', 'selected_action', 'CreditLimit',
+        'expected_tnv', 'primary_policy_reason', 'update_direction',
+        'validity_days', 'output_version',
+        'binding_cap', 'all_triggered_reasons', 'config_hash',
+        'policy_version', 'decision_status', 'after_vw6_cap',
+    ]
+    _available_snapshot_cols = [c for c in _snapshot_cols if c in final_capacity_df.columns]
     snapshot_df = (
-        final_capacity_df[[
-            'feature_dt', 'subscriber_msisdn', 'selected_action', 'CreditLimit',
-            'expected_tnv', 'primary_policy_reason', 'update_direction',
-            'validity_days', 'output_version'
-        ]]
+        final_capacity_df[_available_snapshot_cols]
         .merge(
             layer0_df[[
                 'feature_dt', 'subscriber_msisdn',

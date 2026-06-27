@@ -42,7 +42,7 @@ _LAYER0_COLS = [
     'behavior_consistency_score_v1_rule', 'identity_confidence_score_v1_rule',
 ]
 
-_DIFF_FIELDS = ['CreditLimit', 'selected_action', 'decision_status', 'primary_policy_reason']
+_DIFF_FIELDS = ['CreditLimit', 'selected_action', 'decision_status', 'primary_policy_reason', 'binding_cap', 'config_hash', 'policy_version']
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +127,7 @@ def diff_decisions(original_df, replayed_df, tolerance_amt=1.0):
         if pd.isna(delta) or delta > tolerance_amt:
             changed.append('CreditLimit')
 
-        for field in ['selected_action', 'decision_status', 'primary_policy_reason']:
+        for field in [f for f in _DIFF_FIELDS if f != 'CreditLimit']:
             orig_val = row.get(f'{field}_orig')
             repl_val = row.get(f'{field}_repl')
             if orig_val != repl_val:

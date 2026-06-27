@@ -52,6 +52,7 @@ REQUIRED_CONFIG_KEYS = frozenset([
     "tnv_future_margin_multiplier",
     "tnv_churn_cost_multiplier",
     "tnv_treatment_cost_scalar",
+    "policy_version",
 ])
 
 

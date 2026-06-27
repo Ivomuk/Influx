@@ -15,10 +15,14 @@
 # The API does not expose internal scores, states, or reason codes externally.
 # It returns only the fields permitted by the external lender interface (Layer 9).
 
+import logging
+
 import pandas as pd
 import numpy as np
 import time
 from datetime import datetime, timezone
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +159,7 @@ def check_eligibility(msisdn, config_dict=None, previous_credit_limit=None):
         )
     except Exception as exc:
         latency_ms = round((time.perf_counter() - t_start) * 1000, 1)
-        print(f'ENGINE_ERROR for MSISDN {msisdn}: {exc}')
+        _log.error('ENGINE_ERROR for MSISDN %s: %s', msisdn, exc)
         return {
             'MSISDN': msisdn,
             'CreditLimit': api_config['no_data_credit_limit'],
@@ -170,14 +174,14 @@ def check_eligibility(msisdn, config_dict=None, previous_credit_limit=None):
     total_ms = round((time.perf_counter() - t_start) * 1000, 1)
 
     if api_config.get('log_timing', False):
-        print(
-            f'MSISDN={msisdn} | path={path_used} | age={age_min:.1f}min | '
-            f'feature_read={feature_read_ms}ms | engine={engine_ms}ms | total={total_ms}ms'
+        _log.info(
+            'MSISDN=%s | path=%s | age=%.1fmin | feature_read=%sms | engine=%sms | total=%sms',
+            msisdn, path_used, age_min, feature_read_ms, engine_ms, total_ms
         )
 
     # SLA breach warning (does not block response — graceful degradation).
     if total_ms > api_config['latency_budget_total_ms']:
-        print(f'LATENCY_SLA_BREACH: MSISDN={msisdn} total={total_ms}ms > {api_config["latency_budget_total_ms"]}ms')
+        _log.warning('LATENCY_SLA_BREACH: MSISDN=%s total=%sms > %sms', msisdn, total_ms, api_config['latency_budget_total_ms'])
 
     # ------------------------------------------------------------------
     # Step 3: Build external-facing response (no internal fields exposed)
@@ -187,7 +191,7 @@ def check_eligibility(msisdn, config_dict=None, previous_credit_limit=None):
         'CreditLimit': int(decision.get('CreditLimit', 0)),
         'validity_period_days': int(decision.get('validity_days', local_config.get('validity_days_restrict', 7))),
         'decision_timestamp': datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-        'policy_version': api_config['policy_version'],
+        'policy_version': str(decision.get('policy_version', api_config.get('policy_version', ''))),
         'decision_status': str(decision.get('decision_status', 'unknown')),
         'is_stale': int(is_stale),
         'latency_ms': total_ms,
@@ -287,13 +291,13 @@ def check_eligibility_batch(msisdn_list, config_dict=None, previous_capacity_df=
                     'CreditLimit': int(dec_row.get('CreditLimit', 0)),
                     'validity_period_days': int(dec_row.get('validity_days', local_config.get('validity_days_restrict', 7))),
                     'decision_timestamp': decision_ts,
-                    'policy_version': api_config['policy_version'],
+                    'policy_version': str(dec_row.get('policy_version', api_config.get('policy_version', ''))),
                     'decision_status': str(dec_row.get('decision_status', 'unknown')),
                     'is_stale': int(stale_lookup.get(msisdn, 0)),
                 })
 
         except Exception as exc:
-            print(f'BATCH_ENGINE_ERROR: {exc}')
+            _log.error('BATCH_ENGINE_ERROR: %s', exc)
             decision_ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
             for _, row in data_df.iterrows():
                 responses.append({
@@ -311,10 +315,10 @@ def check_eligibility_batch(msisdn_list, config_dict=None, previous_capacity_df=
     response_df['batch_latency_ms'] = total_ms
 
     if api_config.get('log_timing', False):
-        print(f'Batch eligibility: {len(msisdn_list)} MSISDNs in {total_ms}ms')
+        _log.info('Batch eligibility: %d MSISDNs in %sms', len(msisdn_list), total_ms)
 
     if total_ms > api_config['latency_budget_total_ms'] * len(msisdn_list):
-        print(f'LATENCY_SLA_BREACH: batch of {len(msisdn_list)} took {total_ms}ms')
+        _log.warning('LATENCY_SLA_BREACH: batch of %d took %sms', len(msisdn_list), total_ms)
 
     return response_df
 

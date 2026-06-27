@@ -45,6 +45,7 @@ DECISION_ENGINE_CONFIG = {
     'tnv_future_margin_multiplier': 0.05,
     'tnv_churn_cost_multiplier': 0.03,
     'tnv_treatment_cost_scalar': 500.0,
+    'policy_version': 'credit_v1_policy_2026-06-26',
 }
 
 ACTION_SPECS_DF = pd.DataFrame([
@@ -318,6 +319,7 @@ def evaluate_tnv_actions(policy_prefilter_input_df, action_specs_input_df, confi
             'feature_dt': allowed['feature_dt'].values,
             'subscriber_msisdn': allowed['subscriber_msisdn'].values,
             'primary_policy_reason': allowed['primary_policy_reason'].values,
+            'all_triggered_reasons': allowed['all_triggered_reasons'].values,
             'action': spec['action'],
             'target_capacity_raw': target_capacity_raw.values,
             'immediate_lending_margin': immediate_lending_margin.values,
@@ -510,10 +512,10 @@ def select_final_capacity_output(tnv_actions_input_df, config_dict, previous_cap
     )
 
     final_cols = [
-        'feature_dt', 'subscriber_msisdn', 'primary_policy_reason', 'selected_action',
-        'decision_status', 'expected_tnv', 'target_capacity_raw', 'target_capacity_policy_capped',
-        'target_capacity_stability_adjusted', 'prev_credit_limit', 'after_vw6_cap',
-        'binding_cap', 'CreditLimit',
+        'feature_dt', 'subscriber_msisdn', 'primary_policy_reason', 'all_triggered_reasons',
+        'selected_action', 'decision_status', 'expected_tnv', 'target_capacity_raw',
+        'target_capacity_policy_capped', 'target_capacity_stability_adjusted',
+        'prev_credit_limit', 'after_vw6_cap', 'binding_cap', 'CreditLimit',
         'update_direction', 'validity_days', 'output_version', 'policy_version', 'config_hash'
     ]
     return best_df[[c for c in final_cols if c in best_df.columns]].copy()

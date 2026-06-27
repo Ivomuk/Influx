@@ -412,8 +412,11 @@ def build_governance_log_df(policy_prefilter_df, state_df, final_capacity_df, go
         .merge(state_df[['feature_dt', 'subscriber_msisdn', 'operating_state', 'treatment_path',
                           'persistence_block_applied']],
                on=['feature_dt', 'subscriber_msisdn'], how='left', validate='one_to_one')
-        .merge(final_capacity_df[['feature_dt', 'subscriber_msisdn', 'selected_action',
-                                   'CreditLimit', 'decision_status', 'prev_credit_limit']],
+        .merge(final_capacity_df[[c for c in [
+                    'feature_dt', 'subscriber_msisdn', 'selected_action',
+                    'CreditLimit', 'decision_status', 'prev_credit_limit',
+                    'config_hash', 'policy_version', 'binding_cap', 'all_triggered_reasons',
+               ] if c in final_capacity_df.columns]],
                on=['feature_dt', 'subscriber_msisdn'], how='left', validate='one_to_one')
     )
 
@@ -446,6 +449,7 @@ def build_governance_log_df(policy_prefilter_df, state_df, final_capacity_df, go
         'feature_dt', 'subscriber_msisdn', 'operating_state', 'treatment_path',
         'selected_action', 'CreditLimit', 'prev_credit_limit', 'decision_status',
         'primary_policy_reason', 'persistence_block_applied',
+        'config_hash', 'policy_version', 'binding_cap', 'all_triggered_reasons',
         'decision_engine_version', 'state_engine_version',
         'manual_review_required_flag', 'manual_review_queue',
         'override_permission_roles', 'audit_trigger_flag', 'oversight_note'

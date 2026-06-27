@@ -53,6 +53,7 @@ OPERATING_MODE_THRESHOLDS = {
     'distressed_rate_manual_review':        0.25,
     'distressed_rate_freeze':               0.40,
     'fraud_review_rate_conservative':       0.10,
+    'fraud_review_rate_manual_review':      0.15,
     'fraud_review_rate_freeze':             0.20,
     # Circuit breaker multiplier bands
     'circuit_breaker_conservative':         0.75,
@@ -163,6 +164,9 @@ def detect_operating_mode(
         if fr > t['fraud_review_rate_freeze']:
             mode = _escalate(mode, OPERATING_MODE_FREEZE)
             reasons.append(f'FRAUD_RATE_CRITICAL: {fr:.1%}')
+        elif fr > t['fraud_review_rate_manual_review']:
+            mode = _escalate(mode, OPERATING_MODE_MANUAL_REVIEW_ONLY)
+            reasons.append(f'FRAUD_RATE_HIGH: {fr:.1%}')
         elif fr > t['fraud_review_rate_conservative']:
             mode = _escalate(mode, OPERATING_MODE_CONSERVATIVE)
             reasons.append(f'FRAUD_RATE_ELEVATED: {fr:.1%}')

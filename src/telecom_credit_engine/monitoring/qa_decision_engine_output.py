@@ -17,6 +17,8 @@ VALID_ACTIONS = {'DECLINE', 'RESTRICT', 'REDUCE', 'MAINTAIN', 'INCREASE_SMALL', 
 #   blocked_or_restricted → RESTRICT action (prior credit, now blocked); manage existing exposure
 #   approved_or_maintained → all other actions; CreditLimit > 0
 VALID_DECISION_STATUSES = {'approved_or_maintained', 'blocked_or_restricted', 'declined'}
+VALID_BINDING_CAPS = {'UNCONSTRAINED', 'POLICY_CAP', 'VW6_CAP', 'STABILITY_UPPER', 'STABILITY_LOWER', 'TNV_NEGATIVE', 'RESTRICT', 'BUDGET_CONSTRAINT'}
+
 VALID_REASON_CODES = {
     'LOW_IDENTITY_CONFIDENCE', 'HIGH_FRAUD_ABUSE_RISK', 'SEVERE_DSI',
     'RECENT_DISBURSEMENT_NO_REPAYMENT', 'TIMING_MANIPULATION_DETECTED',
@@ -102,6 +104,33 @@ def qa_final_capacity(final_capacity_df, config_dict, previous_capacity_df=None)
         results['QA-DE-07_stability_bounds_violated'] = _fail(
             violated[['subscriber_msisdn', 'CreditLimit', 'prev_limit']],
             'QA-DE-07'
+        )
+
+    # QA-DE-08: config_hash must be non-empty and 64 characters (SHA-256)
+    if 'config_hash' in df.columns:
+        blank_hash = df['config_hash'].isin(['', None]) | df['config_hash'].isna()
+        wrong_len = (~blank_hash) & (df.loc[~blank_hash, 'config_hash'].str.len() != 64).reindex(df.index, fill_value=False)
+        bad_hash = blank_hash | wrong_len
+        results['QA-DE-08_invalid_config_hash'] = _fail(
+            df[bad_hash][['feature_dt', 'subscriber_msisdn', 'config_hash']],
+            'QA-DE-08'
+        )
+
+    # QA-DE-09: binding_cap must be a valid value
+    if 'binding_cap' in df.columns:
+        invalid_caps = ~df['binding_cap'].isin(VALID_BINDING_CAPS)
+        results['QA-DE-09_invalid_binding_cap'] = _fail(
+            df[invalid_caps][['feature_dt', 'subscriber_msisdn', 'binding_cap']],
+            'QA-DE-09'
+        )
+
+    # QA-DE-10: UNCONSTRAINED binding_cap with CreditLimit=0 on lending-positive actions
+    if 'binding_cap' in df.columns:
+        lending_positive = ~df['selected_action'].isin(['DECLINE', 'RESTRICT'])
+        unconstrained_zero = (df['binding_cap'] == 'UNCONSTRAINED') & (df['CreditLimit'] == 0) & lending_positive
+        results['QA-DE-10_unconstrained_zero_limit'] = _fail(
+            df[unconstrained_zero][['feature_dt', 'subscriber_msisdn', 'binding_cap', 'selected_action', 'CreditLimit']],
+            'QA-DE-10'
         )
 
     return results

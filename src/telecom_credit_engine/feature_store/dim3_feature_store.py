@@ -13,6 +13,7 @@
 # In production replace the dict with Redis GET/SET calls or a managed feature store.
 
 import pandas as pd
+import threading
 import numpy as np
 from datetime import datetime, timezone
 
@@ -29,6 +30,8 @@ GRACEFUL_DEGRADATION_MAX_AGE_MINUTES = 60   # beyond this, do not serve
 _hot_store: dict = {}       # { msisdn: { 'features': {...}, 'written_at': datetime } }
 _warm_store: dict = {}      # same schema, written by near-realtime exposure refresh
 _cold_store: dict = {}      # written by batch job, refreshed daily
+
+_store_lock = threading.RLock()
 
 
 def _now_utc():
@@ -51,11 +54,12 @@ def write_hot_features(features_df):
     Called by the 15-minute scheduled feature refresh job.
     features_df must contain subscriber_msisdn as a column.
     """
-    now = _now_utc()
-    for _, row in features_df.iterrows():
-        msisdn = str(row['subscriber_msisdn'])
-        _hot_store[msisdn] = {'features': row.to_dict(), 'written_at': now}
-    print(f'Hot path: wrote {len(features_df)} subscriber records at {now.isoformat()}')
+    with _store_lock:
+        now = _now_utc()
+        for _, row in features_df.iterrows():
+            msisdn = str(row['subscriber_msisdn'])
+            _hot_store[msisdn] = {'features': row.to_dict(), 'written_at': now}
+        print(f'Hot path: wrote {len(features_df)} subscriber records at {now.isoformat()}')
 
 
 def write_warm_features(msisdn, updated_exposure_amt, lender_event_type):
@@ -65,11 +69,12 @@ def write_warm_features(msisdn, updated_exposure_amt, lender_event_type):
     to avoid stale non-exposure features being treated as fresh.
     Called by compute_near_realtime_exposure_update in dim6_lender_feedback_api.
     """
-    now = _now_utc()
-    existing = _warm_store.get(str(msisdn), {}).get('features', {}).copy()
-    existing['outstanding_exposure_amt'] = updated_exposure_amt
-    existing['last_exposure_update_event'] = lender_event_type
-    _warm_store[str(msisdn)] = {'features': existing, 'written_at': now}
+    with _store_lock:
+        now = _now_utc()
+        existing = _warm_store.get(str(msisdn), {}).get('features', {}).copy()
+        existing['outstanding_exposure_amt'] = updated_exposure_amt
+        existing['last_exposure_update_event'] = lender_event_type
+        _warm_store[str(msisdn)] = {'features': existing, 'written_at': now}
 
 
 def write_cold_features(features_df):
@@ -77,11 +82,12 @@ def write_cold_features(features_df):
     Writes the daily batch SQL output (from vw3 + vw4) to the cold path.
     Called once per day by the batch pipeline.
     """
-    now = _now_utc()
-    for _, row in features_df.iterrows():
-        msisdn = str(row['subscriber_msisdn'])
-        _cold_store[msisdn] = {'features': row.to_dict(), 'written_at': now}
-    print(f'Cold path: wrote {len(features_df)} subscriber records at {now.isoformat()}')
+    with _store_lock:
+        now = _now_utc()
+        for _, row in features_df.iterrows():
+            msisdn = str(row['subscriber_msisdn'])
+            _cold_store[msisdn] = {'features': row.to_dict(), 'written_at': now}
+        print(f'Cold path: wrote {len(features_df)} subscriber records at {now.isoformat()}')
 
 
 # ---------------------------------------------------------------------------
@@ -98,24 +104,25 @@ def read_features(msisdn, allow_stale=False, stale_threshold_minutes=None):
     stale_threshold_minutes: overrides HOT_PATH_MAX_AGE_MINUTES for is_stale calculation,
     allowing callers (e.g. the eligibility API) to drive staleness from their own config.
     """
-    msisdn_str = str(msisdn)
-    threshold = stale_threshold_minutes if stale_threshold_minutes is not None else HOT_PATH_MAX_AGE_MINUTES
-    max_age = GRACEFUL_DEGRADATION_MAX_AGE_MINUTES if allow_stale else threshold
+    with _store_lock:
+        msisdn_str = str(msisdn)
+        threshold = stale_threshold_minutes if stale_threshold_minutes is not None else HOT_PATH_MAX_AGE_MINUTES
+        max_age = GRACEFUL_DEGRADATION_MAX_AGE_MINUTES if allow_stale else threshold
 
-    for path_name, store in [('hot', _hot_store), ('warm', _warm_store), ('cold', _cold_store)]:
-        entry = store.get(msisdn_str)
-        if entry is None:
-            continue
-        age = _age_minutes(entry['written_at'])
-        is_stale = age > threshold
+        for path_name, store in [('hot', _hot_store), ('warm', _warm_store), ('cold', _cold_store)]:
+            entry = store.get(msisdn_str)
+            if entry is None:
+                continue
+            age = _age_minutes(entry['written_at'])
+            is_stale = age > threshold
 
-        if age <= max_age or allow_stale:
-            return entry['features'], path_name, age, is_stale
+            if age <= max_age or allow_stale:
+                return entry['features'], path_name, age, is_stale
 
-    raise RuntimeError(
-        f'No feature data available for MSISDN {msisdn_str} within '
-        f'{GRACEFUL_DEGRADATION_MAX_AGE_MINUTES} minutes on any path.'
-    )
+        raise RuntimeError(
+            f'No feature data available for MSISDN {msisdn_str} within '
+            f'{GRACEFUL_DEGRADATION_MAX_AGE_MINUTES} minutes on any path.'
+        )
 
 
 def read_features_batch(msisdn_list, allow_stale=False, stale_threshold_minutes=None):
@@ -126,26 +133,27 @@ def read_features_batch(msisdn_list, allow_stale=False, stale_threshold_minutes=
     and path_used = 'none'.
     stale_threshold_minutes: forwarded to read_features() for each MSISDN.
     """
-    rows = []
-    for msisdn in msisdn_list:
-        try:
-            features, path_used, age_min, is_stale = read_features(
-                msisdn, allow_stale=allow_stale, stale_threshold_minutes=stale_threshold_minutes
-            )
-            row = dict(features)
-            row['subscriber_msisdn'] = msisdn
-            row['path_used'] = path_used
-            row['feature_age_minutes'] = round(age_min, 1)
-            row['is_stale'] = int(is_stale)
-        except RuntimeError:
-            row = {
-                'subscriber_msisdn': msisdn,
-                'path_used': 'none',
-                'feature_age_minutes': None,
-                'is_stale': 1
-            }
-        rows.append(row)
-    return pd.DataFrame(rows)
+    with _store_lock:
+        rows = []
+        for msisdn in msisdn_list:
+            try:
+                features, path_used, age_min, is_stale = read_features(
+                    msisdn, allow_stale=allow_stale, stale_threshold_minutes=stale_threshold_minutes
+                )
+                row = dict(features)
+                row['subscriber_msisdn'] = msisdn
+                row['path_used'] = path_used
+                row['feature_age_minutes'] = round(age_min, 1)
+                row['is_stale'] = int(is_stale)
+            except RuntimeError:
+                row = {
+                    'subscriber_msisdn': msisdn,
+                    'path_used': 'none',
+                    'feature_age_minutes': None,
+                    'is_stale': 1
+                }
+            rows.append(row)
+        return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -158,11 +166,12 @@ def load_from_batch_output(layer1_df, layer0_df):
     In production this is called by the nightly pipeline after SQL views complete.
     Also bootstraps the hot path so the first eligibility API requests don't miss.
     """
-    merged_df = layer1_df.merge(layer0_df, on=['feature_dt', 'subscriber_msisdn'], how='inner')
-    write_cold_features(merged_df)
-    write_hot_features(merged_df)
-    print(f'Feature store initialised from batch output: {len(merged_df)} subscribers.')
-    return merged_df
+    with _store_lock:
+        merged_df = layer1_df.merge(layer0_df, on=['feature_dt', 'subscriber_msisdn'], how='inner')
+        write_cold_features(merged_df)
+        write_hot_features(merged_df)
+        print(f'Feature store initialised from batch output: {len(merged_df)} subscribers.')
+        return merged_df
 
 
 # ---------------------------------------------------------------------------
@@ -174,22 +183,23 @@ def get_store_health():
     Returns a summary dict of each path's record count, freshest write, and oldest write.
     Useful for monitoring dashboards and alerting.
     """
-    def _summarise(store, name):
-        if not store:
-            return {'path': name, 'record_count': 0, 'freshest_write': None, 'oldest_write': None, 'max_age_minutes': None}
-        ages = [_age_minutes(v['written_at']) for v in store.values()]
-        written_ats = [v['written_at'] for v in store.values()]
-        return {
-            'path': name,
-            'record_count': len(store),
-            'freshest_write': max(written_ats).isoformat(),
-            'oldest_write': min(written_ats).isoformat(),
-            'max_age_minutes': round(max(ages), 1),
-        }
+    with _store_lock:
+        def _summarise(store, name):
+            if not store:
+                return {'path': name, 'record_count': 0, 'freshest_write': None, 'oldest_write': None, 'max_age_minutes': None}
+            ages = [_age_minutes(v['written_at']) for v in store.values()]
+            written_ats = [v['written_at'] for v in store.values()]
+            return {
+                'path': name,
+                'record_count': len(store),
+                'freshest_write': max(written_ats).isoformat(),
+                'oldest_write': min(written_ats).isoformat(),
+                'max_age_minutes': round(max(ages), 1),
+            }
 
-    health = pd.DataFrame([
-        _summarise(_hot_store, 'hot'),
-        _summarise(_warm_store, 'warm'),
-        _summarise(_cold_store, 'cold'),
-    ])
-    return health
+        health = pd.DataFrame([
+            _summarise(_hot_store, 'hot'),
+            _summarise(_warm_store, 'warm'),
+            _summarise(_cold_store, 'cold'),
+        ])
+        return health
