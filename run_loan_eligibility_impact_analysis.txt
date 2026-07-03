@@ -42,10 +42,10 @@ ANALYSIS_CONFIG = {
     'base_margin_rate': 0.10,
     'data_window_days': 30,
     'full_rule_window_days': 90,
-    # Multiply 30-day txn/value metrics to approximate 90-day equivalent.
-    # Set to 3.0 when 90-day history is available; keep at 1.0 for current data.
+    # window_scale_factor: 1.0 because vw2_aggregated now covers the genuine
+    # 90-day window (Mar 2 – May 31 2026). No scaling needed.
     'window_scale_factor': 1.0,
-    'output_version': 'loan_eligibility_impact_v4_rule1_date_params',
+    'output_version': 'loan_eligibility_impact_v5_90d_window',
 }
 
 ELIGIBILITY_RULES = {
@@ -510,7 +510,7 @@ def build_executive_summary(df, waterfall_df, config):
         ('Sources used',                                'vw1, vw3, account_holder_dump, fm_momo_loan_portfolio_cummulation'),
         ('Revenue method',                              'loan_disb_amt_30d × 10% margin (no score multiplier)'),
         ('Rule 1 status',                               r1_status),
-        ('Rules 3 & 4 status',                         '30-day proxy for 90-day window (extend window_90d_start in params CTE)'),
+        ('Rules 3 & 4 status',                         '90-day window active (Mar 2 – May 31 2026). window_90d_start = DATE 2026-03-02'),
         ('Rules 5 & 6 status',                         'Loan portfolio table — 30-day loan term confirmed'),
     ]
 
@@ -578,8 +578,8 @@ def run_loan_eligibility_impact_analysis(eligibility_df, config=None, scenarios=
     sep = '=' * 80
     print(sep)
     print('  LOAN ELIGIBILITY IMPACT ANALYSIS — BANKTECH')
-    print(f'  Data window: April 2026 (30d)  |  Version: {local_config["output_version"]}')
-    print('  Sources: vw1, vw2, vw3, fm_momo_loan_portfolio_cummulation. Scores/decisions excluded.')
+    print(f'  Data window: Mar–May 2026 (90d) |  Version: {local_config["output_version"]}')
+    print('  Sources: vw2, vw3, account_holder_dump, fm_momo_loan_portfolio_cummulation. Scores/decisions excluded.')
     print(sep)
 
     print('\n── EXECUTIVE SUMMARY ──')
@@ -616,11 +616,16 @@ def run_loan_eligibility_impact_analysis(eligibility_df, config=None, scenarios=
 # ============================================================
 # EXECUTE
 # ============================================================
-# Load eligibility_df from the SQL view before running:
+# Option A — load from a CSV export of vw_loan_eligibility_waterfall_v2:
 #
-#   eligibility_df = <query vw_loan_eligibility_waterfall into a DataFrame>
+#   eligibility_df = pd.read_csv('waterfall_v2_export.csv')
 #
-# Then run:
+# Option B — load directly via Trino/PyHive connection:
+#
+#   from trino.dbapi import connect
+#   conn = connect(host='<trino-host>', port=443, user='<user>', catalog='<catalog>', schema='<schema>')
+#   eligibility_df = pd.read_sql('SELECT * FROM vw_loan_eligibility_waterfall_v2', conn)
+
 impact_results = run_loan_eligibility_impact_analysis(eligibility_df)
 
 # Access individual output tables:
