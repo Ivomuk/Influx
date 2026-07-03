@@ -32,7 +32,9 @@ if __name__ == '__main__':
     models_dict, metrics_dict = train_all_pd_models(training_df, pd_config)
 
     for model_name, metrics in metrics_dict.items():
-        print(f'  {model_name}: train_auc={metrics["train_auc"]:.4f} n_rows={metrics["n_rows"]}')
+        print(f'  {model_name}: train_auc={metrics["train_auc"]:.4f} '
+              f'test_auc={metrics["test_auc"]:.4f} '
+              f'n_rows={metrics["n_rows"]} (holdout={metrics["holdout_fraction"]:.0%})')
 
     metadata = save_pd_models(models_dict, metrics_dict, pd_config, _DEFAULT_OUTPUT_DIR)
     print(f'Saved PD model artifacts to {_DEFAULT_OUTPUT_DIR}')

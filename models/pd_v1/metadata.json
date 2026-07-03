@@ -1,6 +1,6 @@
 {
   "model_version": "pd_v1_ensemble_2026-07-03",
-  "trained_at": "2026-07-03T07:56:11.693155+00:00",
+  "trained_at": "2026-07-03T12:12:31.715408+00:00",
   "feature_names": [
     "repayment_ratio_30d",
     "repayment_ratio_trend_7d",
@@ -17,21 +17,34 @@
   ],
   "metrics": {
     "logreg": {
-      "train_auc": 0.7392946744836706,
-      "n_rows": 2000
+      "train_auc": 0.7411030115165853,
+      "test_auc": 0.6898779612347451,
+      "n_rows": 2000,
+      "n_test_rows": 500,
+      "holdout_fraction": 0.25
     },
     "rf": {
-      "train_auc": 0.7679232106343946,
-      "n_rows": 2000
+      "train_auc": 0.7707083478557498,
+      "test_auc": 0.6762717240688494,
+      "n_rows": 2000,
+      "n_test_rows": 500,
+      "holdout_fraction": 0.25
     },
     "xgb": {
-      "train_auc": 0.8620370329829108,
-      "n_rows": 2000
+      "train_auc": 0.8836930566782103,
+      "test_auc": 0.6487754386550694,
+      "n_rows": 2000,
+      "n_test_rows": 500,
+      "holdout_fraction": 0.25
     },
     "lgbm": {
-      "train_auc": 0.9190521955768834,
-      "n_rows": 2000
+      "train_auc": 0.9398160164331957,
+      "test_auc": 0.6209786473897728,
+      "n_rows": 2000,
+      "n_test_rows": 500,
+      "holdout_fraction": 0.25
     }
   },
+  "validation_methodology": "stratified holdout for test_auc; shipped artifact refit on full data",
   "synthetic_training_data": true
 }

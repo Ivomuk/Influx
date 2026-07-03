@@ -43,6 +43,24 @@ OUTCOME_TRACKING_CONFIG = {
     'dsi_min_band_size': 5,
     # How many days of snapshots to retain for outcome joins.
     'snapshot_retention_days': 365,
+    # ------------------------------------------------------------------
+    # Default definition (obligor-level, two limbs; Basel Art. 178 is the
+    # conceptual frame only — this platform is not a regulated bank and
+    # these are NOT compliance parameters). Materiality thresholds are
+    # uncalibrated placeholders pending real lender-feedback outcomes.
+    # Known gap: no cure/probation period is modelled yet — an obligor
+    # re-enters "performing" immediately outside the horizon window.
+    # ------------------------------------------------------------------
+    # A DEFAULT event only triggers the label if the amount is material...
+    'default_materiality_abs_floor': 100.0,   # absolute floor, currency units; PLACEHOLDER
+    'default_materiality_rel_pct': 0.01,      # ...or >= 1% of CreditLimit; PLACEHOLDER
+    # ...and, when days_past_due is reported, at least this many days late.
+    'default_materiality_min_dpd': 90,        # standard 90-DPD criterion
+    # Unlikeliness-to-pay statuses trigger default directly, no materiality test.
+    'utp_loan_statuses': ['DEFAULTED', 'WRITTEN_OFF', 'RESTRUCTURED'],
+    # 12-month PD horizon for the default label; repayment calibration keeps
+    # using outcome_lookback_days above.
+    'pd_default_horizon_days': 365,
     # PD model (shadow/challenger ensemble) accuracy check — same shape as
     # calibration_bucket_count/calibration_min_bucket_size but bucketed
     # against did_default_flag rather than did_repay_flag.

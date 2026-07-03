@@ -121,6 +121,7 @@ def ingest_lender_report(validated_report_df, config):
         'msisdn', 'loan_id', 'lender_id', 'event_type', 'event_date',
         'event_amount', 'signed_amount',
         'is_disbursement', 'is_repayment', 'is_default', 'is_status_change',
+        'days_past_due', 'loan_status',
         'ingested_at', 'report_version',
     ]
 
@@ -153,6 +154,15 @@ def ingest_lender_report(validated_report_df, config):
         default=0.0
     )
 
+    # Optional risk fields — needed downstream by outcome tracking for the
+    # 90-DPD and unlikeliness-to-pay limbs of the default definition.
+    if 'days_past_due' in valid_df.columns:
+        valid_df['days_past_due'] = pd.to_numeric(valid_df['days_past_due'], errors='coerce')
+    else:
+        valid_df['days_past_due'] = np.nan
+    if 'loan_status' not in valid_df.columns:
+        valid_df['loan_status'] = None
+
     valid_df['ingested_at'] = datetime.now(timezone.utc).replace(microsecond=0)
     valid_df['report_version'] = config['output_version']
 
@@ -160,6 +170,7 @@ def ingest_lender_report(validated_report_df, config):
         'msisdn', 'loan_id', 'lender_id', 'event_type', 'event_date',
         'event_amount', 'signed_amount',
         'is_disbursement', 'is_repayment', 'is_default', 'is_status_change',
+        'days_past_due', 'loan_status',
         'ingested_at', 'report_version',
     ]
     valid_df = valid_df.rename(columns={

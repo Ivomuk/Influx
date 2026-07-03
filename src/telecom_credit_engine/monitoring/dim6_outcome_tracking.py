@@ -79,22 +79,95 @@ def store_decision_snapshot(final_capacity_df, layer0_df, layer1_df, config):
 
 
 # ---------------------------------------------------------------------------
+# Default Definition — obligor-level, materiality-thresholded
+# ---------------------------------------------------------------------------
+
+def identify_default_events(events_df, config, credit_limit=None):
+    """
+    Returns the subset of events_df that constitute obligor-level default
+    triggers under a two-limb default definition. Basel Art. 178 is the
+    conceptual frame only — this platform is not a regulated bank and these
+    are not compliance parameters.
+
+    Limb 1 — material past-due default: is_default == 1 AND the amount test
+      (event_amount >= default_materiality_abs_floor, OR
+       event_amount >= default_materiality_rel_pct * credit_limit when a
+       positive credit_limit is known) AND, only when days_past_due is
+      reported for the event, days_past_due >= default_materiality_min_dpd.
+      Events without days_past_due are decided by the amount test alone so
+      lender feeds that omit the optional field cannot suppress defaults.
+
+    Limb 2 — unlikeliness to pay (UTP): any event whose loan_status is in
+      utp_loan_statuses triggers default directly, without the materiality
+      test (write-off / distressed restructuring counts regardless of amount).
+
+    Contagion: callers OR the returned triggers per subscriber — a single
+    material or UTP trigger marks the whole obligor as defaulted for the
+    window, including loans individually below the materiality threshold.
+    """
+    abs_floor = config.get('default_materiality_abs_floor', 100.0)
+    rel_pct = config.get('default_materiality_rel_pct', 0.01)
+    min_dpd = config.get('default_materiality_min_dpd', 90)
+    utp_statuses = config.get('utp_loan_statuses', ['DEFAULTED', 'WRITTEN_OFF', 'RESTRUCTURED'])
+
+    if events_df.empty:
+        return events_df.copy()
+
+    df = events_df.copy()
+    amount = pd.to_numeric(df.get('event_amount'), errors='coerce').fillna(0.0)
+
+    # --- Limb 1: material past-due default ---
+    is_default_event = df['is_default'] == 1 if 'is_default' in df.columns \
+        else df.get('event_type') == 'DEFAULT'
+
+    amount_material = amount >= abs_floor
+    if credit_limit is not None and credit_limit > 0:
+        amount_material |= amount >= rel_pct * credit_limit
+
+    if 'days_past_due' in df.columns:
+        dpd = pd.to_numeric(df['days_past_due'], errors='coerce')
+        dpd_passes = dpd.isna() | (dpd >= min_dpd)
+    else:
+        dpd_passes = pd.Series(True, index=df.index)
+
+    material_default = is_default_event & amount_material & dpd_passes
+
+    # --- Limb 2: unlikeliness to pay ---
+    if 'loan_status' in df.columns:
+        utp = df['loan_status'].isin(utp_statuses)
+    else:
+        utp = pd.Series(False, index=df.index)
+
+    return df[material_default | utp].copy()
+
+
+# ---------------------------------------------------------------------------
 # Realised Outcome Computation
 # ---------------------------------------------------------------------------
 
 def compute_realised_outcomes(snapshot_df, lender_feedback_df, evaluation_date, config):
     """
     Joins decision snapshots to actual repayment and default outcomes.
-    Only evaluates snapshots old enough for outcomes to have materialised
-    (snapshot_date + outcome_lookback_days <= evaluation_date).
+    Only evaluates snapshots old enough for repayment outcomes to have
+    materialised (snapshot_date + outcome_lookback_days <= evaluation_date).
+
+    Repayment metrics use the outcome_lookback_days window; the default label
+    uses the (longer) pd_default_horizon_days window with the obligor-level
+    default definition in identify_default_events().
 
     Returns one row per evaluable snapshot with:
       did_repay_flag          : 1 if any repayment was observed in the outcome window
-      did_default_flag        : 1 if a DEFAULT event was reported in the outcome window
+      did_default_flag        : 1 if a material default / UTP trigger occurred
+                                within the PD horizon (see identify_default_events)
+      material_default_amount : sum of triggering default amounts (LGD groundwork)
+      pd_label_mature_flag    : 1 if the full PD horizon has elapsed — labels
+                                with 0 are right-censored and must be excluded
+                                from PD calibration
       actual_repayment_ratio  : total repaid / CreditLimit
       days_to_first_repayment : days from snapshot date to first repayment event
     """
     lookback_days = config['outcome_lookback_days']
+    pd_horizon_days = config.get('pd_default_horizon_days', 365)
     eval_date = pd.to_datetime(evaluation_date)
 
     snap_df = snapshot_df.copy()
@@ -111,33 +184,52 @@ def compute_realised_outcomes(snapshot_df, lender_feedback_df, evaluation_date, 
     ].copy()
     repayments['event_date'] = pd.to_datetime(repayments['event_date'])
 
-    defaults = lender_feedback_df[lender_feedback_df['is_default'] == 1][
-        ['msisdn', 'event_date']
-    ].copy()
-    defaults['event_date'] = pd.to_datetime(defaults['event_date'])
+    # Candidate default triggers: explicit DEFAULT events plus any event
+    # carrying a UTP loan_status (e.g. a STATUS_CHANGE reporting WRITTEN_OFF).
+    utp_statuses = config.get('utp_loan_statuses', ['DEFAULTED', 'WRITTEN_OFF', 'RESTRUCTURED'])
+    feedback_df = lender_feedback_df.copy()
+    for optional_col, default_value in (('days_past_due', np.nan), ('loan_status', None)):
+        if optional_col not in feedback_df.columns:
+            feedback_df[optional_col] = default_value
+    risk_events = feedback_df[
+        (feedback_df['is_default'] == 1)
+        | (feedback_df['loan_status'].isin(utp_statuses))
+    ][['msisdn', 'event_date', 'event_amount', 'is_default', 'days_past_due', 'loan_status']].copy()
+    risk_events['event_date'] = pd.to_datetime(risk_events['event_date'])
 
     outcome_rows = []
     for _, snap_row in evaluable_df.iterrows():
         msisdn = snap_row['subscriber_msisdn']
         snap_dt = snap_row['feature_dt']
         window_end = snap_dt + pd.Timedelta(days=lookback_days)
+        pd_window_end = snap_dt + pd.Timedelta(days=pd_horizon_days)
 
         sub_repayments = repayments[
             (repayments['msisdn'] == msisdn)
             & (repayments['event_date'] >= snap_dt)
             & (repayments['event_date'] <= window_end)
         ]
-        sub_defaults = defaults[
-            (defaults['msisdn'] == msisdn)
-            & (defaults['event_date'] >= snap_dt)
-            & (defaults['event_date'] <= window_end)
-        ]
 
         total_repaid = sub_repayments['event_amount'].sum()
         did_repay = int(len(sub_repayments) > 0)
-        did_default = int(len(sub_defaults) > 0)
 
         credit_limit = snap_row.get('CreditLimit', 0) or 0
+
+        # Default label over the PD horizon: filter this subscriber's risk
+        # events to the horizon window, then apply the two-limb default
+        # definition. Obligor-level contagion: any single trigger marks the
+        # subscriber defaulted regardless of how their other loans performed.
+        sub_risk_events = risk_events[
+            (risk_events['msisdn'] == msisdn)
+            & (risk_events['event_date'] >= snap_dt)
+            & (risk_events['event_date'] <= pd_window_end)
+        ]
+        default_triggers = identify_default_events(sub_risk_events, config, credit_limit=credit_limit)
+        did_default = int(len(default_triggers) > 0)
+        material_default_amount = float(
+            pd.to_numeric(default_triggers['event_amount'], errors='coerce').fillna(0.0).sum()
+        ) if did_default else 0.0
+
         actual_repayment_ratio = (
             total_repaid / credit_limit if credit_limit > 0 else None
         )
@@ -158,10 +250,13 @@ def compute_realised_outcomes(snapshot_df, lender_feedback_df, evaluation_date, 
             'CreditLimit': credit_limit,
             'did_repay_flag': did_repay,
             'did_default_flag': did_default,
+            'material_default_amount': material_default_amount,
+            'pd_label_mature_flag': int(pd_window_end <= eval_date),
             'actual_repayment_ratio': actual_repayment_ratio,
             'days_to_first_repayment': days_to_first,
             'evaluation_date': eval_date,
-            'outcome_window_days': lookback_days
+            'outcome_window_days': lookback_days,
+            'pd_outcome_horizon_days': pd_horizon_days
         })
 
     return pd.DataFrame(outcome_rows)
@@ -285,6 +380,11 @@ def compute_pd_model_accuracy(realised_outcomes_df, config):
     pd_df = realised_outcomes_df.dropna(
         subset=['predicted_pd_score_v1_model', 'did_default_flag']
     ).copy()
+
+    # Exclude right-censored labels: snapshots whose full PD horizon has not
+    # elapsed yet would systematically understate the actual default rate.
+    if 'pd_label_mature_flag' in pd_df.columns:
+        pd_df = pd_df[pd_df['pd_label_mature_flag'] == 1]
 
     if pd_df.empty:
         return pd.DataFrame()

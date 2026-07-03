@@ -68,6 +68,14 @@ class TestTrainAllPdModels:
             # do meaningfully better than random (AUC 0.5).
             assert metrics['train_auc'] > 0.55, f'{model_name} train_auc={metrics["train_auc"]}'
 
+    def test_metrics_include_out_of_sample_auc(self, training_df, pd_config):
+        _, metrics_dict = train_all_pd_models(training_df, pd_config)
+        for model_name, metrics in metrics_dict.items():
+            assert 'test_auc' in metrics, f'{model_name} missing test_auc'
+            assert 0.0 <= metrics['test_auc'] <= 1.0
+            assert metrics['test_auc'] > 0.5, f'{model_name} test_auc={metrics["test_auc"]}'
+            assert metrics['n_test_rows'] == round(metrics['holdout_fraction'] * len(training_df))
+
 
 # ---------------------------------------------------------------------------
 # Save / load round-trip
@@ -100,3 +108,6 @@ class TestSaveLoadRoundTrip:
         assert metadata['model_version'] == pd_config['model_version']
         assert metadata['synthetic_training_data'] is True
         assert set(metadata['metrics'].keys()) == set(MODEL_NAMES)
+        assert 'validation_methodology' in metadata
+        for metrics in metadata['metrics'].values():
+            assert 'test_auc' in metrics
