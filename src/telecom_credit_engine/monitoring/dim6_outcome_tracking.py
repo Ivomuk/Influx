@@ -25,21 +25,30 @@ def store_decision_snapshot(final_capacity_df, layer0_df, layer1_df, config):
         'policy_version', 'decision_status', 'after_vw6_cap',
     ]
     _available_snapshot_cols = [c for c in _snapshot_cols if c in final_capacity_df.columns]
+    _layer0_cols = [
+        'feature_dt', 'subscriber_msisdn',
+        'expected_repayment_probability_v1_rule',
+        'expected_credit_loss_rate_v1_rule',
+        'churn_cooling_probability_v1_rule',
+        'expected_future_transaction_margin_score_v1_rule',
+        'debt_stress_index_v1',
+        'fraud_abuse_risk_score_v1_rule',
+        'behavior_consistency_score_v1_rule',
+        'identity_confidence_score_v1_rule',
+        'customer_lifetime_value_contribution_v1_rule',
+        # PD model (shadow/challenger ensemble) — see scoring/pd_model.py
+        'pd_score_v1_model',
+        'pd_score_logreg_v1',
+        'pd_score_rf_v1',
+        'pd_score_xgb_v1',
+        'pd_score_lgbm_v1',
+        'pd_model_version',
+    ]
+    _available_layer0_cols = [c for c in _layer0_cols if c in layer0_df.columns]
     snapshot_df = (
         final_capacity_df[_available_snapshot_cols]
         .merge(
-            layer0_df[[
-                'feature_dt', 'subscriber_msisdn',
-                'expected_repayment_probability_v1_rule',
-                'expected_credit_loss_rate_v1_rule',
-                'churn_cooling_probability_v1_rule',
-                'expected_future_transaction_margin_score_v1_rule',
-                'debt_stress_index_v1',
-                'fraud_abuse_risk_score_v1_rule',
-                'behavior_consistency_score_v1_rule',
-                'identity_confidence_score_v1_rule',
-                'customer_lifetime_value_contribution_v1_rule'
-            ]],
+            layer0_df[_available_layer0_cols],
             on=['feature_dt', 'subscriber_msisdn'],
             how='left'
         )
@@ -142,6 +151,7 @@ def compute_realised_outcomes(snapshot_df, lender_feedback_df, evaluation_date, 
             'subscriber_msisdn': msisdn,
             'predicted_repayment_probability': snap_row.get('expected_repayment_probability_v1_rule'),
             'predicted_credit_loss_rate': snap_row.get('expected_credit_loss_rate_v1_rule'),
+            'predicted_pd_score_v1_model': snap_row.get('pd_score_v1_model'),
             'predicted_churn_probability': snap_row.get('churn_cooling_probability_v1_rule'),
             'debt_stress_index_v1': snap_row.get('debt_stress_index_v1'),
             'selected_action': snap_row.get('selected_action'),
@@ -257,6 +267,145 @@ def compute_dsi_accuracy(realised_outcomes_df, config):
         print('WARNING: DSI default rates are not monotonically increasing — DSI weights need recalibration.')
 
     return accuracy_df
+
+
+# ---------------------------------------------------------------------------
+# PD Model (Shadow/Challenger Ensemble) Accuracy Validation
+# Mirrors compute_dsi_accuracy()'s pattern, but buckets the model-based PD
+# score into deciles rather than fixed DSI bands.
+# ---------------------------------------------------------------------------
+
+def compute_pd_model_accuracy(realised_outcomes_df, config):
+    """
+    Buckets predicted_pd_score_v1_model into equal-frequency deciles and
+    compares average predicted PD against actual_default_rate per bucket.
+    A well-calibrated PD model shows small calibration_error and monotonically
+    increasing actual_default_rate across buckets.
+    """
+    pd_df = realised_outcomes_df.dropna(
+        subset=['predicted_pd_score_v1_model', 'did_default_flag']
+    ).copy()
+
+    if pd_df.empty:
+        return pd.DataFrame()
+
+    bucket_count = config['pd_calibration_bucket_count']
+    min_bucket_size = config['pd_calibration_min_bucket_size']
+
+    pd_df['pd_score_bucket'] = pd.qcut(
+        pd_df['predicted_pd_score_v1_model'],
+        q=bucket_count,
+        duplicates='drop',
+        labels=False
+    )
+
+    accuracy_df = (
+        pd_df.groupby('pd_score_bucket')
+        .agg(
+            subscriber_count=('did_default_flag', 'count'),
+            avg_predicted_pd=('predicted_pd_score_v1_model', 'mean'),
+            actual_default_rate=('did_default_flag', 'mean')
+        )
+        .reset_index()
+    )
+    accuracy_df = accuracy_df[accuracy_df['subscriber_count'] >= min_bucket_size].copy()
+
+    accuracy_df['calibration_error'] = (
+        accuracy_df['avg_predicted_pd'] - accuracy_df['actual_default_rate']
+    ).abs()
+
+    rates = accuracy_df.sort_values('pd_score_bucket')['actual_default_rate'].values
+    is_monotonic = all(rates[i] <= rates[i + 1] for i in range(len(rates) - 1))
+    accuracy_df['pd_model_is_monotonic'] = int(is_monotonic)
+
+    if not is_monotonic:
+        print('WARNING: PD model default rates are not monotonically increasing across score deciles.')
+
+    return accuracy_df
+
+
+# ---------------------------------------------------------------------------
+# PD Model Correlation Monitoring
+# README "Model risk controls: model correlation monitoring" — near-1
+# pairwise correlation across all 4 challengers means the ensemble isn't
+# adding diversity.
+# ---------------------------------------------------------------------------
+
+def compute_pd_model_correlation(snapshot_df, config):
+    """
+    Computes the pairwise Pearson correlation matrix across the 4 individual
+    PD challenger model scores. Returns one row per model pair with
+    correlation and a flag when it exceeds pd_correlation_warning_threshold.
+    """
+    score_cols = ['pd_score_logreg_v1', 'pd_score_rf_v1', 'pd_score_xgb_v1', 'pd_score_lgbm_v1']
+    available_cols = [c for c in score_cols if c in snapshot_df.columns]
+    df = snapshot_df.dropna(subset=available_cols).copy()
+
+    if len(available_cols) < 2 or df.empty:
+        return pd.DataFrame()
+
+    threshold = config['pd_correlation_warning_threshold']
+    corr_matrix = df[available_cols].corr(method='pearson')
+
+    rows = []
+    for i, model_a in enumerate(available_cols):
+        for model_b in available_cols[i + 1:]:
+            correlation = corr_matrix.loc[model_a, model_b]
+            rows.append({
+                'model_a': model_a,
+                'model_b': model_b,
+                'correlation': correlation,
+                'low_diversity_flag': int(abs(correlation) > threshold),
+            })
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# PD Model Disagreement Detection
+# README "Model risk controls: disagreement detection" — flags subscribers
+# where the PD ensemble diverges materially from the closest existing
+# rule-based proxy (no separate PD/LGD decomposition exists in the rule
+# engine today, so expected_credit_loss_rate_v1_rule is the comparison point).
+# ---------------------------------------------------------------------------
+
+def compute_pd_disagreement(snapshot_df, config):
+    """
+    Flags subscribers where pd_score_v1_model diverges from
+    expected_credit_loss_rate_v1_rule beyond pd_disagreement_threshold, and
+    reports the spread across the 4 individual challenger models.
+    """
+    threshold = config['pd_disagreement_threshold']
+    required_cols = ['pd_score_v1_model', 'expected_credit_loss_rate_v1_rule']
+    if not all(c in snapshot_df.columns for c in required_cols):
+        return pd.DataFrame()
+
+    df = snapshot_df.dropna(subset=required_cols).copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    df['disagreement_delta'] = (
+        df['pd_score_v1_model'] - df['expected_credit_loss_rate_v1_rule']
+    )
+    df['disagreement_flag'] = (df['disagreement_delta'].abs() > threshold).astype(int)
+
+    model_score_cols = [c for c in
+                         ('pd_score_logreg_v1', 'pd_score_rf_v1', 'pd_score_xgb_v1', 'pd_score_lgbm_v1')
+                         if c in df.columns]
+    if model_score_cols:
+        df['pd_model_spread'] = df[model_score_cols].max(axis=1) - df[model_score_cols].min(axis=1)
+
+    system_disagreement_rate = df['disagreement_flag'].mean()
+    print(f'PD model disagreement rate: {system_disagreement_rate:.2%} (threshold={threshold})')
+
+    output_cols = [
+        'feature_dt', 'subscriber_msisdn', 'pd_score_v1_model',
+        'expected_credit_loss_rate_v1_rule', 'disagreement_delta', 'disagreement_flag',
+    ]
+    if 'pd_model_spread' in df.columns:
+        output_cols.append('pd_model_spread')
+
+    return df[output_cols].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -391,8 +540,9 @@ def run_dim6_outcome_tracking(
       2. Compute realised outcomes (if enough time has elapsed)
       3. Compute calibration metrics
       4. Compute DSI accuracy
-      5. Compute fairness metrics
-      6. Generate decision explanations for all subscribers
+      5. Compute PD model (shadow/challenger ensemble) accuracy, correlation, and disagreement
+      6. Compute fairness metrics
+      7. Generate decision explanations for all subscribers
 
     Returns a dict with all DataFrames keyed by name.
     Calibration and DSI outputs are empty DataFrames if not enough outcomes exist yet.
@@ -414,9 +564,14 @@ def run_dim6_outcome_tracking(
 
     calibration_df = pd.DataFrame()
     dsi_accuracy_df = pd.DataFrame()
+    pd_accuracy_df = pd.DataFrame()
     if not realised_outcomes_df.empty:
         calibration_df = compute_calibration_metrics(realised_outcomes_df, local_outcome_config)
         dsi_accuracy_df = compute_dsi_accuracy(realised_outcomes_df, local_outcome_config)
+        pd_accuracy_df = compute_pd_model_accuracy(realised_outcomes_df, local_outcome_config)
+
+    pd_correlation_df = compute_pd_model_correlation(snapshot_df, local_outcome_config)
+    pd_disagreement_df = compute_pd_disagreement(snapshot_df, local_outcome_config)
 
     monitored_segs = local_fairness_config.get('monitored_segment_cols', [])
     fairness_df = (
@@ -430,6 +585,9 @@ def run_dim6_outcome_tracking(
     print('Evaluable outcome rows:', len(realised_outcomes_df))
     print('Calibration buckets:', len(calibration_df))
     print('DSI accuracy bands:', len(dsi_accuracy_df))
+    print('PD model accuracy buckets:', len(pd_accuracy_df))
+    print('PD model correlation pairs flagged:', int(pd_correlation_df['low_diversity_flag'].sum()) if not pd_correlation_df.empty else 0)
+    print('PD model disagreement flags:', int(pd_disagreement_df['disagreement_flag'].sum()) if not pd_disagreement_df.empty else 0)
     print('Fairness segments flagged:', int(fairness_df['disparate_impact_flag'].sum()) if not fairness_df.empty else 0)
     print('Explanations generated:', len(explanations_df))
 
@@ -438,6 +596,9 @@ def run_dim6_outcome_tracking(
         'realised_outcomes_df': realised_outcomes_df,
         'calibration_df': calibration_df,
         'dsi_accuracy_df': dsi_accuracy_df,
+        'pd_accuracy_df': pd_accuracy_df,
+        'pd_correlation_df': pd_correlation_df,
+        'pd_disagreement_df': pd_disagreement_df,
         'fairness_df': fairness_df,
         'explanations_df': explanations_df
     }

@@ -1,0 +1,37 @@
+{
+  "model_version": "pd_v1_ensemble_2026-07-03",
+  "trained_at": "2026-07-03T07:56:11.693155+00:00",
+  "feature_names": [
+    "repayment_ratio_30d",
+    "repayment_ratio_trend_7d",
+    "wallet_inflow_trend_7d_vs_90d",
+    "active_lender_cnt_30d",
+    "disbursement_cnt_30d",
+    "days_since_last_disbursement",
+    "exposure_to_inflow_ratio",
+    "stacked_borrowing_flag_30d",
+    "repeated_borrowing_flag_30d",
+    "timing_manipulation_flag",
+    "suspicious_repayment_jump_flag",
+    "loan_cycling_flag"
+  ],
+  "metrics": {
+    "logreg": {
+      "train_auc": 0.7392946744836706,
+      "n_rows": 2000
+    },
+    "rf": {
+      "train_auc": 0.7679232106343946,
+      "n_rows": 2000
+    },
+    "xgb": {
+      "train_auc": 0.8620370329829108,
+      "n_rows": 2000
+    },
+    "lgbm": {
+      "train_auc": 0.9190521955768834,
+      "n_rows": 2000
+    }
+  },
+  "synthetic_training_data": true
+}

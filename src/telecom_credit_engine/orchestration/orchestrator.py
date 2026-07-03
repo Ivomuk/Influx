@@ -31,6 +31,7 @@ import logging
 import pandas as pd
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 _log = logging.getLogger(__name__)
 
@@ -97,6 +98,33 @@ def run_sql_batch_pipeline(execution_date, batch_engine):
     vw6_df    = batch_engine.read('vw6_credit_v1_cap_and_action',  execution_date)
 
     return layer1_df, layer0_df, vw5_df, vw6_df
+
+
+# ---------------------------------------------------------------------------
+# Step 1.5: PD model scoring (shadow/challenger)
+# Computes the logistic regression / random forest / XGBoost / LightGBM
+# ensemble PD score and merges it onto layer0_df. This score is monitored
+# (Dimension 6 model-risk checks) but does NOT feed evaluate_tnv_actions() —
+# it must not influence CreditLimit while in shadow mode.
+# ---------------------------------------------------------------------------
+
+def run_pd_model_scoring_step(layer1_df, layer0_df, pd_config=None, models_dict=None):
+    from telecom_credit_engine.scoring.pd_model import score_pd_model_ensemble, load_pd_model_config
+    from telecom_credit_engine.scoring.pd_model_training import load_pd_models
+
+    _log.info('PD model scoring (shadow/challenger) starting.')
+    effective_pd_config = pd_config or load_pd_model_config()
+    effective_models_dict = models_dict or load_pd_models(
+        Path(__file__).resolve().parents[3] / 'models' / 'pd_v1'
+    )
+
+    pd_scores_df = score_pd_model_ensemble(layer1_df, effective_models_dict, effective_pd_config)
+    merged_layer0_df = layer0_df.merge(
+        pd_scores_df, on=['feature_dt', 'subscriber_msisdn'], how='left'
+    )
+
+    _log.info('PD model scoring complete. version=%s', effective_pd_config['model_version'])
+    return merged_layer0_df
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +503,9 @@ def run_batch_pipeline(
     outcome_config=None,
     fairness_config=None,
     explainability_config=None,
+    # PD model (shadow/challenger ensemble) — see run_pd_model_scoring_step
+    pd_config=None,
+    pd_models_dict=None,
     # Skip SQL materialisation when tables are already loaded (e.g. manual backfill)
     skip_sql=False,
 ):
@@ -502,6 +533,10 @@ def run_batch_pipeline(
         vw6_df    = batch_engine.read('vw6_credit_v1_cap_and_action',  execution_date)
     else:
         layer1_df, layer0_df, vw5_df, vw6_df = run_sql_batch_pipeline(execution_date, batch_engine)
+
+    # Step 1.5: PD model scoring (shadow/challenger — merged onto layer0_df,
+    # not wired into the TNV math that sets CreditLimit)
+    layer0_df = run_pd_model_scoring_step(layer1_df, layer0_df, pd_config=pd_config, models_dict=pd_models_dict)
 
     # Step 2: Data contracts + QA gates
     run_sql_qa_gates(layer1_df, layer0_df, vw5_df, vw6_df)

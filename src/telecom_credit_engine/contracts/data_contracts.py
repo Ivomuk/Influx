@@ -61,6 +61,8 @@ LAYER0_SCORES_CONTRACT = {
     'fraud_abuse_risk_score_v1_rule':                      {'required': True,  'nullable': False, 'min': 0, 'max': 1},
     'behavior_consistency_score_v1_rule':                  {'required': True,  'nullable': False, 'min': 0, 'max': 1},
     'identity_confidence_score_v1_rule':                   {'required': True,  'nullable': False, 'min': 0, 'max': 1},
+    'pd_score_v1_model':                                   {'required': True,  'nullable': False, 'min': 0, 'max': 1},
+    'pd_model_version':                                    {'required': True,  'nullable': False},
 }
 
 VW5_REASON_CODES_CONTRACT = {

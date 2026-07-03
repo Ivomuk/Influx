@@ -26,7 +26,7 @@ def _minimal_valid_df(contract_name):
             row[col] = pd.Timestamp('2026-04-01')
         elif col == 'subscriber_msisdn':
             row[col] = '256700000001'
-        elif col in ('primary_reason_code', 'recommended_action', 'selected_action', 'decision_status'):
+        elif col in ('primary_reason_code', 'recommended_action', 'selected_action', 'decision_status', 'pd_model_version'):
             row[col] = 'PASS'
         else:
             row[col] = 0.0 if spec['nullable'] else 1.0
@@ -105,6 +105,16 @@ def test_final_capacity_has_decision_status():
     assert 'decision_status' in CONTRACTS['final_capacity']
     assert CONTRACTS['final_capacity']['decision_status']['required']
     assert not CONTRACTS['final_capacity']['decision_status']['nullable']
+
+
+def test_layer0_scores_contract_includes_pd_columns():
+    contract = CONTRACTS['layer0_scores']
+    assert 'pd_score_v1_model' in contract
+    assert 'pd_model_version' in contract
+    assert contract['pd_score_v1_model']['min'] == 0
+    assert contract['pd_score_v1_model']['max'] == 1
+    assert contract['pd_score_v1_model']['required']
+    assert not contract['pd_score_v1_model']['nullable']
 
 
 def test_layer1_nullable_columns_are_correct():

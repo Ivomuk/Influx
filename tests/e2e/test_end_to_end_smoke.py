@@ -23,6 +23,7 @@ from telecom_credit_engine.governance.operating_modes import (
     OPERATING_MODE_NORMAL,
 )
 from telecom_credit_engine.monitoring.qa_decision_engine_output import run_qa_decision_engine_output
+from telecom_credit_engine.orchestration.orchestrator import run_pd_model_scoring_step
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +31,10 @@ from telecom_credit_engine.monitoring.qa_decision_engine_output import run_qa_de
 # ---------------------------------------------------------------------------
 
 def test_full_pipeline_no_qa_failures(layer1_df, layer0_df, default_config, action_specs_df):
+    # PD model (shadow/challenger) scoring runs between the SQL batch pipeline
+    # and the QA/contract gate in the real orchestrator — mirror that here so
+    # layer0_df satisfies the (now PD-extended) layer0_scores contract.
+    layer0_df = run_pd_model_scoring_step(layer1_df, layer0_df)
     validate_all_pipeline_inputs(layer1_df, layer0_df, strict=True)
 
     outputs = run_credit_v1_decision_engine(

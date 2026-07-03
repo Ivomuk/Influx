@@ -43,6 +43,17 @@ OUTCOME_TRACKING_CONFIG = {
     'dsi_min_band_size': 5,
     # How many days of snapshots to retain for outcome joins.
     'snapshot_retention_days': 365,
+    # PD model (shadow/challenger ensemble) accuracy check — same shape as
+    # calibration_bucket_count/calibration_min_bucket_size but bucketed
+    # against did_default_flag rather than did_repay_flag.
+    'pd_calibration_bucket_count': 10,
+    'pd_calibration_min_bucket_size': 5,
+    # Kept as independent knobs here (rather than imported from
+    # configs/pd_model_v1_config.yaml) so this module has no hard dependency
+    # on the scoring package's config loader. Default values mirror the PD
+    # YAML's disagreement_threshold / correlation_warning_threshold.
+    'pd_disagreement_threshold': 0.25,
+    'pd_correlation_warning_threshold': 0.98,
     'output_version': 'credit_v1_outcome_tracking_v1'
 }
 

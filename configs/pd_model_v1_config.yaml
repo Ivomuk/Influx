@@ -1,0 +1,80 @@
+# Probability-of-Default (PD) Model Configuration — Shadow/Challenger Ensemble
+# -----------------------------------------------------------------------------
+# Four challenger models (logistic regression, random forest, XGBoost,
+# LightGBM) are trained independently and combined via ensemble_weights into
+# pd_score_v1_model. This score is a shadow/challenger output only — it is
+# monitored (monitoring/dim6_outcome_tracking.py) but does not feed the TNV
+# math that sets CreditLimit (decisioning/run_credit_v1_decision_engine.py).
+#
+# Every production PD score row carries the SHA-256 hash of the config that
+# produced it, same convention as credit_v1_policy_config.yaml.
+
+model_version: "pd_v1_ensemble_2026-07-03"
+
+# --- Features consumed by every model (restricted to the columns guaranteed
+# by LAYER1_FEATURES_CONTRACT plus one derived ratio) ---
+feature_names:
+  - repayment_ratio_30d
+  - repayment_ratio_trend_7d
+  - wallet_inflow_trend_7d_vs_90d
+  - active_lender_cnt_30d
+  - disbursement_cnt_30d
+  - days_since_last_disbursement
+  - exposure_to_inflow_ratio
+  - stacked_borrowing_flag_30d
+  - repeated_borrowing_flag_30d
+  - timing_manipulation_flag
+  - suspicious_repayment_jump_flag
+  - loan_cycling_flag
+
+# --- Fallback values used when a feature column is absent or null ---
+feature_defaults:
+  repayment_ratio_30d: 0.50
+  repayment_ratio_trend_7d: 0.0
+  wallet_inflow_trend_7d_vs_90d: 1.0
+  active_lender_cnt_30d: 0
+  disbursement_cnt_30d: 0
+  days_since_last_disbursement: 30
+  exposure_to_inflow_ratio: 0.0
+  stacked_borrowing_flag_30d: 0
+  repeated_borrowing_flag_30d: 0
+  timing_manipulation_flag: 0
+  suspicious_repayment_jump_flag: 0
+  loan_cycling_flag: 0
+
+# --- Ensemble combination: pd_score_v1_model = weighted average of the 4 ---
+ensemble_weights:
+  logreg: 0.25
+  rf: 0.25
+  xgb: 0.25
+  lgbm: 0.25
+
+# --- Model risk monitoring thresholds ---
+disagreement_threshold: 0.25        # |pd_score_v1_model - expected_credit_loss_rate_v1_rule| beyond this flags disagreement
+correlation_warning_threshold: 0.98 # pairwise correlation between challenger models above this flags low ensemble diversity
+
+# --- Per-model hyperparameters (small-dataset-appropriate defaults) ---
+model_hyperparameters:
+  logistic_regression:
+    C: 1.0
+    max_iter: 1000
+    random_state: 42
+  random_forest:
+    n_estimators: 200
+    max_depth: 5
+    min_samples_leaf: 20
+    random_state: 42
+  xgboost:
+    n_estimators: 150
+    max_depth: 3
+    learning_rate: 0.1
+    eval_metric: "logloss"
+    random_state: 42
+  lightgbm:
+    n_estimators: 150
+    max_depth: 4
+    num_leaves: 15
+    learning_rate: 0.1
+    min_child_samples: 20
+    random_state: 42
+    verbosity: -1
