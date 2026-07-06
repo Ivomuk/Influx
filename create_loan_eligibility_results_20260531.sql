@@ -84,8 +84,8 @@ subscriber_reg AS (
     FROM (
         SELECT
             msisdn,
-            TRY(date_parse(registration_date, '%Y%m%d')) AS parsed_reg_dt,
-            TRY(date_parse(activation_date,   '%Y%m%d')) AS parsed_act_dt
+            TRY(date_parse(registration_date, '%d-%b-%y')) AS parsed_reg_dt,
+            TRY(date_parse(activation_date,   '%d-%b-%y')) AS parsed_act_dt
         FROM devdata.account_holder_dump
         WHERE tbl_dt               = 20260531          -- literal partition key: Trino prunes at plan time
           AND account_type         = 'MOBILE MONEY'

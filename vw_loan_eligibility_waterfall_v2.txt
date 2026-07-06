@@ -42,8 +42,9 @@
 --       1. registration_date  (date simcard was purchased)
 --       2. activation_date    (date first PIN reset was made)
 --       3. first_activity_dt  (earliest vw2 event date — fallback only)
---     registration_date and activation_date are VARCHAR YYYYMMDD ('20260501').
---     Parsed via date_parse(col, '%Y%m%d') with TRY() to handle nulls.
+--     registration_date and activation_date are VARCHAR DD-MON-YY ('18-NOV-25').
+--     Parsed via date_parse(col, '%d-%b-%y') with TRY() to handle nulls/bad values.
+--     Two-digit year: 00–68 → 2000–2068, 69–99 → 1969–1999 (Trino %y convention).
 --   Rules 3 & 4 (transaction count / value windows):
 --     90-DAY WINDOW ACTIVE. window_90d_start = DATE '2026-03-02' (Mar 2 – May 31 2026).
 --     vw2 run_date = '2026-05-31' snapshot contains all event_dt rows back to March.
@@ -100,8 +101,8 @@ subscriber_reg AS (
     FROM (
         SELECT
             msisdn,
-            TRY(date_parse(registration_date, '%Y%m%d')) AS parsed_reg_dt,
-            TRY(date_parse(activation_date,   '%Y%m%d')) AS parsed_act_dt
+            TRY(date_parse(registration_date, '%d-%b-%y')) AS parsed_reg_dt,
+            TRY(date_parse(activation_date,   '%d-%b-%y')) AS parsed_act_dt
         FROM devdata.account_holder_dump
         WHERE tbl_dt               = 20260531          -- literal partition key: Trino prunes at plan time
           AND account_type         = 'MOBILE MONEY'
