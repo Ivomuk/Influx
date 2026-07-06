@@ -1,65 +1,369 @@
 -- ============================================================
 -- create_loan_eligibility_results_20260531.sql
--- MATERIALIZATION — run this AFTER vw_loan_eligibility_waterfall_v2
--- has been created and verified.
+-- MATERIALIZATION — run this instead of (or after) creating
+-- the vw_loan_eligibility_waterfall_v2 view.
 --
 -- PURPOSE:
---   Persists the full eligibility result set as a physical Parquet table
---   so that:
---     1. The Python analysis script can query it without loading 20M rows
---        into local memory.
---     2. Repeated ad-hoc queries hit the materialized table, not the live
---        view, eliminating repeated scans of vw2, vw3, account_holder_dump,
---        and fm_momo_loan_portfolio_cummulation.
---     3. Results are stable — re-running the view later (e.g. after a data
---        update) will not silently change previously reported numbers.
+--   Persists the full eligibility result set as a physical Parquet
+--   table so that:
+--     1. Downstream queries and the Python analysis script hit a
+--        fast materialized table rather than re-scanning vw2, vw3,
+--        account_holder_dump, and fm_momo_loan_portfolio_cummulation.
+--     2. Results are stable — re-running the view after a data
+--        refresh will not silently change reported numbers.
+--     3. The 20M-row dataset can be queried by the Python script
+--        via chunksize streaming without a local OOM.
+--
+-- SOURCES (same as vw_loan_eligibility_waterfall_v2):
+--   devdata.account_holder_dump                (partitioned by tbl_dt)
+--   analytics.mobile_money_profiles            (subscriber profile filter)
+--   vw2_credit_v1_subscriber_day               (physical TABLE, May 2026, partitioned by run_date)
+--   vw3_credit_v1_layer1_features              (physical TABLE, May 2026, partitioned by run_date)
+--   wamujap.fm_momo_loan_portfolio_cummulation (partitioned by tbl_dt)
 --
 -- HOW TO USE:
---   1. Run vw_loan_eligibility_waterfall_v2 (CREATE OR REPLACE VIEW) first.
---   2. Run this script once per analysis cycle (~1–2 minutes expected).
---   3. All downstream queries and the Python analysis script should reference
---      wamujap.loan_eligibility_results_20260531 instead of the view.
+--   1. Run this script once per analysis cycle (~1–2 minutes).
+--   2. All downstream queries reference wamujap.loan_eligibility_results_20260531.
+--   3. The view (vw_loan_eligibility_waterfall_v2) does NOT need to
+--      exist — this script is fully self-contained.
 --
 -- TO UPDATE FOR A NEW CYCLE (e.g. June 30 2026):
---   Replace 20260531 → 20260630 throughout this file.
---   Update vw_loan_eligibility_waterfall_v2 params first (analysis_end_date,
---   window_30d_start, window_90d_start, run_date literals, tbl_dt literals).
---   Drop the previous month's results table if no longer needed.
+--   Search-replace 20260531 → 20260630 and update ALL FIVE date
+--   literals in the params CTE and WHERE clauses below:
+--     analysis_end_date  DATE '2026-05-31'  → DATE '2026-06-30'
+--     window_30d_start   DATE '2026-05-01'  → DATE '2026-06-01'
+--     window_90d_start   DATE '2026-03-02'  → DATE '2026-04-01'
+--     run_date           '2026-05-31'       → '2026-06-30'
+--     tbl_dt             20260531           → 20260630
 -- ============================================================
 
--- Safe to re-run — drops previous version of this cycle's table only.
 DROP TABLE IF EXISTS wamujap.loan_eligibility_results_20260531;
 
--- Materialize the full waterfall output as a Parquet table.
--- Column order and names match vw_loan_eligibility_waterfall_v2 exactly.
 CREATE TABLE wamujap.loan_eligibility_results_20260531
 WITH (
     format         = 'PARQUET',
     partitioned_by = ARRAY['analysis_dt']
 )
 AS
+
+-- ── Analysis window & partition key reference ─────────────────
+-- TO CHANGE THE ANALYSIS CYCLE: update ALL FIVE values below consistently,
+-- then search-replace each literal throughout this file.
+--
+--   analysis_end_date  DATE '2026-05-31'   last day of the analysis month
+--   window_30d_start   DATE '2026-05-01'   first day of the analysis month
+--   window_90d_start   DATE '2026-03-02'   90-day lookback start (Mar 2 – May 31 2026)
+--   run_date           '2026-05-31'        partition key for vw2 and vw3 (VARCHAR) ← literal in WHERE, not in CTE
+--   tbl_dt             20260531            partition key for loan portfolio AND account_holder_dump ← literal in WHERE, not in CTE
+--
+-- WHY run_date and tbl_dt are NOT in the params CTE:
+--   Trino resolves partition keys at PLAN TIME from literal constants only.
+--   A value derived from a CROSS JOIN CTE is resolved at RUNTIME, causing
+--   Trino to scan ALL partitions before filtering. Using literals ensures
+--   partition pruning fires and each table scan reads only the target partition.
+WITH params AS (
+    SELECT
+        DATE '2026-05-31'  AS analysis_end_date,
+        DATE '2026-05-01'  AS window_30d_start,
+        DATE '2026-03-02'  AS window_90d_start    -- 90-day lookback: Mar 2 – May 31 2026
+),
+
+-- ── Rule 1: subscriber registration / activation dates ────────
+-- Source: devdata.account_holder_dump (MOBILE MONEY, ACTIVE subscribers only).
+-- tbl_dt = 20260531 is a literal constant — Trino prunes to that partition at
+-- plan time, avoiding a full table scan. Both accountholder_status and
+-- account_status must be 'ACTIVE'; profile must be a known subscriber profile.
+-- registration_date and activation_date are VARCHAR YYYYMMDD (e.g. '20260501').
+-- Sub-select parses each date column once; outer SELECT aliases and derives.
+subscriber_reg AS (
+    SELECT
+        msisdn,
+        parsed_reg_dt                              AS registration_date,
+        parsed_act_dt                              AS activation_date,
+        COALESCE(parsed_reg_dt, parsed_act_dt)     AS derived_reg_date
+    FROM (
+        SELECT
+            msisdn,
+            TRY(date_parse(registration_date, '%Y%m%d')) AS parsed_reg_dt,
+            TRY(date_parse(activation_date,   '%Y%m%d')) AS parsed_act_dt
+        FROM devdata.account_holder_dump
+        WHERE tbl_dt               = 20260531          -- literal partition key: Trino prunes at plan time
+          AND account_type         = 'MOBILE MONEY'
+          AND accountholder_status = 'ACTIVE'
+          AND account_status       = 'ACTIVE'
+          AND profile IN (SELECT profile_name FROM analytics.mobile_money_profiles WHERE subscriber_flag = true)
+    )
+),
+
+-- ── Single vw2 scan: replaces subscriber_base + mau30_activity + momo_activity ──
+-- vw2 is a physical table at (event_dt, subscriber_msisdn) daily grain.
+-- 90 days of history available. Conditional aggregation in one pass.
+vw2_aggregated AS (
+    SELECT
+        d.subscriber_msisdn,
+        -- subscriber_base equivalents
+        MIN(d.event_dt)               AS first_activity_dt,
+        MAX(d.event_dt)               AS last_activity_dt,
+        COUNT(*)                      AS total_active_days,   -- vw2 grain: one row per (subscriber, day) so COUNT(*) = COUNT(DISTINCT event_dt)
+        -- Rule 2: MAU30 — days with any activity in the 30-day window
+        SUM(CASE
+            WHEN d.event_dt BETWEEN p.window_30d_start AND p.analysis_end_date
+            THEN 1 ELSE 0
+        END)                          AS active_days_last30d, -- SUM(1) safe: one row per day per subscriber in vw2
+        -- Rule 3: wallet transaction count in window
+        -- vw2.wallet_txn_cnt_day counts wallet_inflow + wallet_outflow + spend_behavior
+        SUM(CASE
+            WHEN d.event_dt BETWEEN p.window_90d_start AND p.analysis_end_date
+            THEN d.wallet_txn_cnt_day ELSE 0
+        END)                          AS momo_txn_cnt_30d,
+        -- Rule 4: wallet inflow and outflow amounts in window
+        SUM(CASE
+            WHEN d.event_dt BETWEEN p.window_90d_start AND p.analysis_end_date
+            THEN d.wallet_inflow_amt_day ELSE 0.0
+        END)                          AS momo_inflow_30d,
+        SUM(CASE
+            WHEN d.event_dt BETWEEN p.window_90d_start AND p.analysis_end_date
+            THEN d.wallet_outflow_amt_day ELSE 0.0
+        END)                          AS momo_outflow_30d
+    FROM vw2_credit_v1_subscriber_day d
+    CROSS JOIN params p
+    WHERE d.run_date = '2026-05-31'   -- literal partition key: Trino prunes at plan time (VARCHAR column)
+    GROUP BY d.subscriber_msisdn
+),
+
+-- layer1_latest CTE removed.
+-- vw3 is joined directly on (subscriber_msisdn, last_activity_dt) in eligibility_base.
+-- Rationale: vw3 rows are keyed by (subscriber_msisdn, feature_dt) where feature_dt
+-- comes from anchor_days = SELECT DISTINCT event_dt FROM vw2. Therefore
+-- MAX(feature_dt) in vw3 = MAX(event_dt) in vw2 = last_activity_dt already
+-- computed in vw2_aggregated. Joining on last_activity_dt is a direct primary-key
+-- lookup — one scan instead of the previous double scan (inner MAX + outer join).
+
+-- ── Single loan portfolio scan: shared by Rules 5 & 6 ────────
+-- tbl_dt = 20260531 is a literal constant so Trino prunes to that partition
+-- at plan time. Using a CTE-derived value (e.g. p.loan_snapshot_tbl_dt) would
+-- defeat pruning and cause a full cross-partition scan (tested: ~50 min).
+-- disbursement_date >= 20240101 is a raw integer comparison applied at scan
+-- time to skip pre-2024 rows before date conversion.
+-- Pre-filtered to vw2 msisdns: only subscribers in the waterfall output are needed.
+-- VARCHAR YYYYMMDD → DATE conversion done once in the inner sub-select.
+-- cooling_off_end_date pre-computed so loan_cooling_off_signals avoids
+-- repeating date_add('day', 90, repayment_date) in two places.
+loan_portfolio_base AS (
+    SELECT
+        msisdn, loan_id, loan_disbursed, outstanding_loan, loan_repaid,
+        disbursement_date,
+        repayment_date,
+        date_add('day', 90, repayment_date)  AS cooling_off_end_date,  -- NULL when loan_repaid != 1
+        snapshot_date,
+        lookback_start
+    FROM (
+        SELECT
+            lp.msisdn,
+            lp.loan_id,
+            lp.loan_disbursed,
+            lp.outstanding_loan,
+            lp.loan_repaid,
+            CAST(date_parse(CAST(lp.disbursement_date AS VARCHAR), '%Y%m%d') AS DATE) AS disbursement_date,
+            CASE WHEN lp.loan_repaid = 1
+                 THEN CAST(date_parse(CAST(lp.repayment_date AS VARCHAR), '%Y%m%d') AS DATE)
+            END                                                                         AS repayment_date,
+            p.analysis_end_date  AS snapshot_date,
+            p.window_90d_start   AS lookback_start
+        FROM wamujap.fm_momo_loan_portfolio_cummulation lp
+        CROSS JOIN params p
+        WHERE lp.tbl_dt            = 20260531              -- literal partition key (see params header note)
+          AND lp.disbursement_date IS NOT NULL
+          AND lp.disbursement_date >= 20240101              -- raw integer guard; skip pre-2024 rows at scan time
+          AND lp.msisdn IN (SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day WHERE run_date = '2026-05-31')
+    )
+),
+
+-- ── Rule 5: overdue loans (active, unrepaid, > 60 days old) ──
+-- No lookback_start filter here. lookback_start scopes Rules 3 & 4 (transaction
+-- windows) but is incompatible with Rule 5: a loan overdue > 60 days as of
+-- May 31 was by definition disbursed before April 1, which is outside the
+-- 30-day proxy window (May 1). The tbl_dt filter in loan_portfolio_base already
+-- limits the scan to the May 31 snapshot — no further date scoping is needed.
+loan_overdue_signals AS (
+    SELECT
+        msisdn,
+        approx_distinct(loan_id)                                       AS overdue_loan_count,
+        SUM(outstanding_loan)                                          AS total_overdue_amount,
+        MAX(date_diff('day', disbursement_date, snapshot_date))        AS max_days_outstanding,
+        1                                                              AS overdue_60d_flag
+    FROM loan_portfolio_base
+    WHERE loan_repaid      = 0
+      AND outstanding_loan > 0
+      AND disbursement_date < date_add('day', -60, snapshot_date)   -- disbursed > 60 days before analysis date
+    GROUP BY msisdn
+),
+
+-- ── Rule 6: cooling-off after late repayment ──────────────────
+-- Loan term = 30 days (confirmed). Late = days_to_repay > 30. Window = 90 days.
+loan_cooling_off_signals AS (
+    SELECT
+        msisdn,
+        approx_distinct(loan_id)                         AS cooling_off_loan_count,
+        MAX(repayment_date)                              AS latest_late_repayment_date,
+        MAX(cooling_off_end_date)                        AS latest_cooling_off_end_date,  -- pre-computed in loan_portfolio_base
+        SUM(loan_disbursed)                              AS cooling_off_affected_loan_value,
+        1                                                AS cooling_off_flag
+    FROM loan_portfolio_base
+    WHERE loan_repaid    = 1
+      AND repayment_date IS NOT NULL
+      AND repayment_date > date_add('day', 30, disbursement_date)  -- equivalent to date_diff > 30; range form aids pushdown
+      AND snapshot_date BETWEEN repayment_date AND cooling_off_end_date
+    GROUP BY msisdn
+),
+
+-- ── Eligibility flags per subscriber ─────────────────────────
+-- Inner sub-select computes momo_age_days once; outer SELECT derives rule1
+-- from it instead of repeating the date_diff expression.
+eligibility_base AS (
+    SELECT
+        *,
+        CASE WHEN momo_age_days >= 180 THEN 1 ELSE 0 END  AS rule1_momo_age_180d_flag
+    FROM (
+        SELECT
+            agg.subscriber_msisdn,
+            agg.first_activity_dt,
+            agg.last_activity_dt,
+            agg.total_active_days,
+
+            -- Rule 1 diagnostic columns (from devdata.account_holder_dump)
+            sr.derived_reg_date,
+            sr.registration_date                              AS reg_registration_date,
+            sr.activation_date                               AS reg_activation_date,
+            date_diff('day',
+                COALESCE(sr.derived_reg_date, agg.first_activity_dt),
+                p.analysis_end_date
+            )                                                AS momo_age_days,
+
+            -- Rule 2: MAU30 — active in last 30 days
+            CASE WHEN COALESCE(agg.active_days_last30d, 0) >= 1 THEN 1 ELSE 0 END  AS rule2_mau30_flag,
+            COALESCE(agg.active_days_last30d, 0)            AS active_days_last30d,
+
+            -- Rule 3: >= 5 MoMo transactions in window
+            CASE WHEN COALESCE(agg.momo_txn_cnt_30d, 0) >= 5
+                 THEN 1 ELSE 0 END                          AS rule3_min_5txn_flag,
+            COALESCE(agg.momo_txn_cnt_30d, 0)              AS momo_txn_cnt_30d,
+
+            -- Rule 4: >= UGX 10,000 inflow or outflow in window
+            CASE WHEN   COALESCE(agg.momo_inflow_30d,  0) >= 10000
+                   OR   COALESCE(agg.momo_outflow_30d, 0) >= 10000
+                 THEN 1 ELSE 0 END                          AS rule4_min_10k_value_flag,
+            COALESCE(agg.momo_inflow_30d,  0)              AS momo_inflow_30d,
+            COALESCE(agg.momo_outflow_30d, 0)              AS momo_outflow_30d,
+
+            -- Rule 5: No active term loan overdue > 60 days
+            CASE WHEN lov.overdue_60d_flag = 1 THEN 0 ELSE 1 END  AS rule5_no_overdue_60d_flag,
+
+            -- Rule 6: Not in cooling-off period
+            CASE WHEN lco.cooling_off_flag = 1 THEN 0 ELSE 1 END  AS rule6_no_cooling_off_flag,
+
+            -- ── Financial features (from vw3) ──────────────────────
+            COALESCE(l1.outstanding_exposure_amt,          0.0)   AS outstanding_exposure_amt,
+            l1.repayment_ratio_30d,
+            COALESCE(l1.repayment_cnt_30d,                 0)     AS repayment_cnt_30d,
+            COALESCE(l1.disbursement_cnt_30d,              0)     AS disbursement_cnt_30d,
+            COALESCE(l1.wallet_inflow_amt_30d,             0.0)   AS wallet_inflow_amt_30d,
+            COALESCE(l1.wallet_outflow_amt_30d,            0.0)   AS wallet_outflow_amt_30d,
+            COALESCE(l1.wallet_txn_cnt_30d,                0)     AS wallet_txn_cnt_30d,
+            COALESCE(l1.wallet_active_days_30d,            0)     AS wallet_active_days_30d,
+            COALESCE(l1.loan_disb_amt_30d,                 0.0)   AS loan_disb_amt_30d,
+            COALESCE(l1.loan_repaid_amt_30d,               0.0)   AS loan_repaid_amt_30d,
+            l1.days_since_last_disbursement,
+            l1.days_since_last_repayment,
+            l1.last_disbursement_dt,
+            l1.last_repayment_dt,
+            COALESCE(l1.stacked_borrowing_flag_30d,        0)     AS stacked_borrowing_flag_30d,
+            COALESCE(l1.repeated_borrowing_flag_30d,       0)     AS repeated_borrowing_flag_30d,
+            COALESCE(l1.active_lender_cnt_30d,             0)     AS active_lender_cnt_30d,
+            COALESCE(l1.alt_credit_active_flag_30d,        0)     AS alt_credit_active_flag_30d,
+
+            -- ── Loan portfolio signals ──────────────────────────────
+            COALESCE(lov.overdue_loan_count,               0)     AS overdue_loan_count,
+            COALESCE(lov.total_overdue_amount,             0.0)   AS total_overdue_amount,
+            COALESCE(lov.max_days_outstanding,             0)     AS max_days_outstanding,
+            COALESCE(lco.cooling_off_loan_count,           0)     AS cooling_off_loan_count,
+            COALESCE(lco.cooling_off_affected_loan_value,  0.0)   AS cooling_off_affected_loan_value,
+            lco.latest_late_repayment_date,
+            lco.latest_cooling_off_end_date
+
+        FROM vw2_aggregated agg
+        CROSS JOIN params p
+        LEFT JOIN subscriber_reg                      sr  ON agg.subscriber_msisdn = sr.msisdn
+        LEFT JOIN vw3_credit_v1_layer1_features       l1  ON  l1.subscriber_msisdn = agg.subscriber_msisdn
+                                                          AND l1.feature_dt         = agg.last_activity_dt
+                                                          AND l1.run_date           = '2026-05-31'  -- literal partition key (VARCHAR column)
+        LEFT JOIN loan_overdue_signals                lov ON agg.subscriber_msisdn = lov.msisdn
+        LEFT JOIN loan_cooling_off_signals            lco ON agg.subscriber_msisdn = lco.msisdn
+    )
+),
+
+-- ── Waterfall: cumulative eligibility after each rule ─────────
+waterfall AS (
+    SELECT
+        *,
+
+        CASE WHEN disbursement_cnt_30d > 0 THEN 1 ELSE 0 END  AS currently_active_borrower_flag,
+
+        rule1_momo_age_180d_flag                               AS eligible_after_rule1,
+
+        CASE WHEN rule1_momo_age_180d_flag = 1
+              AND rule2_mau30_flag          = 1
+             THEN 1 ELSE 0 END                                 AS eligible_after_rule2,
+
+        CASE WHEN rule1_momo_age_180d_flag = 1
+              AND rule2_mau30_flag          = 1
+              AND rule3_min_5txn_flag       = 1
+             THEN 1 ELSE 0 END                                 AS eligible_after_rule3,
+
+        CASE WHEN rule1_momo_age_180d_flag = 1
+              AND rule2_mau30_flag          = 1
+              AND rule3_min_5txn_flag       = 1
+              AND rule4_min_10k_value_flag  = 1
+             THEN 1 ELSE 0 END                                 AS eligible_after_rule4,
+
+        CASE WHEN rule1_momo_age_180d_flag = 1
+              AND rule2_mau30_flag          = 1
+              AND rule3_min_5txn_flag       = 1
+              AND rule4_min_10k_value_flag  = 1
+              AND rule5_no_overdue_60d_flag = 1
+             THEN 1 ELSE 0 END                                 AS eligible_after_rule5,
+
+        CASE WHEN rule1_momo_age_180d_flag = 1
+              AND rule2_mau30_flag          = 1
+              AND rule3_min_5txn_flag       = 1
+              AND rule4_min_10k_value_flag  = 1
+              AND rule5_no_overdue_60d_flag = 1
+              AND rule6_no_cooling_off_flag = 1
+             THEN 1 ELSE 0 END                                 AS proposed_eligible_flag,
+
+        loan_disb_amt_30d * 0.10                               AS estimated_monthly_revenue
+
+    FROM eligibility_base
+)
+
 SELECT
-    -- ── Subscriber identity ───────────────────────────────────
     subscriber_msisdn,
     first_activity_dt,
     last_activity_dt,
     total_active_days,
-
-    -- ── Rule 1: registration / activation diagnostics ─────────
+    -- Rule 1 registration diagnostics
     derived_reg_date,
     reg_registration_date,
     reg_activation_date,
     momo_age_days,
-
-    -- ── Eligibility rule flags ────────────────────────────────
+    -- Rule flags
     rule1_momo_age_180d_flag,
     rule2_mau30_flag,
     rule3_min_5txn_flag,
     rule4_min_10k_value_flag,
     rule5_no_overdue_60d_flag,
     rule6_no_cooling_off_flag,
-
-    -- ── Waterfall — cumulative eligibility after each rule ────
+    -- Waterfall eligibility
     eligible_after_rule1,
     eligible_after_rule2,
     eligible_after_rule3,
@@ -67,14 +371,12 @@ SELECT
     eligible_after_rule5,
     proposed_eligible_flag,
     currently_active_borrower_flag,
-
-    -- ── Activity metrics (vw2, 90-day window) ─────────────────
+    -- Activity metrics
     active_days_last30d,
     momo_txn_cnt_30d,
     momo_inflow_30d,
     momo_outflow_30d,
-
-    -- ── Financial features (vw3) ──────────────────────────────
+    -- Financial features (vw3)
     outstanding_exposure_amt,
     repayment_ratio_30d,
     repayment_cnt_30d,
@@ -89,14 +391,12 @@ SELECT
     days_since_last_repayment,
     last_disbursement_dt,
     last_repayment_dt,
-
-    -- ── Risk behaviour flags (vw3) ────────────────────────────
+    -- Risk behaviour flags (vw3)
     stacked_borrowing_flag_30d,
     repeated_borrowing_flag_30d,
     active_lender_cnt_30d,
     alt_credit_active_flag_30d,
-
-    -- ── Loan portfolio signals (fm_momo_loan_portfolio_cummulation) ──
+    -- Loan portfolio signals (fm_momo_loan_portfolio_cummulation)
     overdue_loan_count,
     total_overdue_amount,
     max_days_outstanding,
@@ -104,28 +404,22 @@ SELECT
     cooling_off_affected_loan_value,
     latest_late_repayment_date,
     latest_cooling_off_end_date,
-
-    -- ── Revenue estimate ──────────────────────────────────────
+    -- Revenue estimate
     estimated_monthly_revenue,
-
-    -- ── Partition column ──────────────────────────────────────
-    -- Allows future months to be appended to the same table.
-    -- Keep as a DATE literal matching analysis_end_date in the view params.
+    -- Partition column — matches analysis_end_date in params CTE
     DATE '2026-05-31'  AS analysis_dt
 
-FROM vw_loan_eligibility_waterfall_v2;
+FROM waterfall;
 
 -- ── Verification ──────────────────────────────────────────────
--- Row count and key flag totals — compare against the view directly
--- to confirm the materialization is complete and consistent.
 SELECT
-    COUNT(*)                         AS total_rows,
-    SUM(proposed_eligible_flag)      AS eligible_total,
-    SUM(eligible_after_rule1)        AS after_rule1,
-    SUM(eligible_after_rule2)        AS after_rule2,
-    SUM(eligible_after_rule3)        AS after_rule3,
-    SUM(eligible_after_rule4)        AS after_rule4,
-    SUM(eligible_after_rule5)        AS after_rule5,
+    COUNT(*)                            AS total_rows,
+    SUM(proposed_eligible_flag)         AS eligible_total,
+    SUM(eligible_after_rule1)           AS after_rule1,
+    SUM(eligible_after_rule2)           AS after_rule2,
+    SUM(eligible_after_rule3)           AS after_rule3,
+    SUM(eligible_after_rule4)           AS after_rule4,
+    SUM(eligible_after_rule5)           AS after_rule5,
     SUM(currently_active_borrower_flag) AS active_borrowers,
     ROUND(SUM(estimated_monthly_revenue), 0) AS est_monthly_revenue
 FROM wamujap.loan_eligibility_results_20260531
