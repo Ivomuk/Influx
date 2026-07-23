@@ -27,8 +27,7 @@
 --
 -- LOAN TABLE FILTERS:
 --   partner_name != 'Xtrafloat'  — Xtrafloat rows are agent accounts, analysed separately.
---   ova != 'MoMo Advance'        — MoMo Advance is an overdraft product, not a term loan.
---                                   Verify exact ova value from a MoMo Advance sample row.
+--   ova != 'MOMO-ADVANCE'        — MoMo Advance is an overdraft product, not a term loan.
 --
 -- DATA LIMITATION NOTES:
 --   Rule 1 (MoMo age >= 180 days):
@@ -48,12 +47,11 @@
 --     days_aging is pre-computed in the source table — no date arithmetic needed.
 --     Excludes agents (Xtrafloat) and MoMo Advance overdrafts.
 --   Rule 6 (cooling-off after delayed repayment):
---     Source: analytics.momo_loan_book_tracker_loan_state_daily (last_repayment_date IS NOT NULL).
+--     Source: analytics.momo_loan_book_tracker_loan_state_daily.
 --     last_repayment_date is a native DATE column — no casting needed.
---     Late repayment proxy: date_diff(last_disbursement_date, last_repayment_date) > 30 days.
+--     Repaid loan filter: loan_status IN ('CLOSED', 'SETTLED').
+--     Late repayment: date_diff(last_disbursement_date, last_repayment_date) > 30 days.
 --     Cooling-off window = 90 days after repayment date.
---     NOTE: if a more precise loan_status filter for fully repaid loans is available
---     (e.g. loan_status = 'CLOSED'), add it to loan_cooling_off_signals below.
 -- ============================================================
 
 CREATE OR REPLACE VIEW vw_loan_eligibility_waterfall_v3 AS
@@ -155,10 +153,8 @@ vw2_aggregated AS (
 -- no INTEGER→DATE casting required (unlike v2).
 -- cooling_off_end_date pre-computed once for reuse in loan_cooling_off_signals.
 -- Exclusions:
---   partner_name = 'Xtrafloat' — agent accounts, analysed separately.
---   ova = 'MoMo Advance'       — overdraft product, not a term loan.
---                                 Verify this value from a MoMo Advance sample row
---                                 and update if the column or value differs.
+--   partner_name = 'Xtrafloat'   — agent accounts, analysed separately.
+--   ova = 'MOMO-ADVANCE'         — overdraft product, not a term loan.
 loan_tracker_base AS (
     SELECT
         lt.customer_msisdn                                  AS msisdn,
@@ -176,7 +172,7 @@ loan_tracker_base AS (
     CROSS JOIN params p
     WHERE lt.date_key      = 20260531              -- literal partition key: Trino prunes at plan time
       AND lt.partner_name != 'Xtrafloat'           -- exclude agent accounts
-      AND lt.ova          != 'MoMo Advance'        -- exclude overdraft product
+      AND lt.ova          != 'MOMO-ADVANCE'          -- exclude overdraft product
       AND lt.customer_msisdn IN (
           SELECT subscriber_msisdn FROM vw2_credit_v1_subscriber_day WHERE run_date = '2026-05-31'
       )
@@ -200,11 +196,10 @@ loan_overdue_signals AS (
 ),
 
 -- ── Rule 6: cooling-off after late repayment ──────────────────
+-- Considers only fully repaid loans: loan_status IN ('CLOSED', 'SETTLED').
 -- last_repayment_date is a native DATE column — no casting required.
--- Late repayment proxy: date_diff(last_disbursement_date, last_repayment_date) > 30 days.
+-- Late repayment: date_diff(last_disbursement_date, last_repayment_date) > 30 days.
 -- Cooling-off active: snapshot_date falls within 90 days of repayment.
--- If a specific loan_status value for fully repaid loans is known
--- (e.g. loan_status = 'CLOSED'), add AND loan_status = 'CLOSED' below.
 loan_cooling_off_signals AS (
     SELECT
         msisdn,
@@ -214,7 +209,8 @@ loan_cooling_off_signals AS (
         SUM(lifetime_disbursed_ugx)                          AS cooling_off_affected_loan_value,
         1                                                    AS cooling_off_flag
     FROM loan_tracker_base
-    WHERE last_repayment_date IS NOT NULL
+    WHERE loan_status IN ('CLOSED', 'SETTLED')
+      AND last_repayment_date IS NOT NULL
       AND date_diff('day', last_disbursement_date, last_repayment_date) > 30
       AND snapshot_date BETWEEN last_repayment_date AND cooling_off_end_date
     GROUP BY msisdn
