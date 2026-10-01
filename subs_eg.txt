@@ -103,13 +103,11 @@ derisk_exclusions as (
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Rule 5: No active term loan overdue by more than 60 days.
 -- days_aging is pre-computed in the source table — no date arithmetic needed.
--- Excludes Xtrafloat agent accounts (analysed separately).
 -- ─────────────────────────────────────────────────────────────────────────────
 active_overdue_60d as (
     select distinct customer_msisdn as msisdn
     from analytics.momo_loan_book_tracker_loan_state_daily
     where date_key      = {RUN_DATE_KEY}
-      and partner_name != 'Xtrafloat'
       and outstanding_ugx > 0
       and days_aging    > 60
 ),
@@ -121,13 +119,11 @@ active_overdue_60d as (
 --   last_repayment_date > last_disbursement_date + 60 days
 --   i.e. date_diff(last_disbursement_date, last_repayment_date) > 60
 -- Cooling-off runs 90 days from the actual repayment date.
--- Excludes Xtrafloat agent accounts (analysed separately).
 -- ─────────────────────────────────────────────────────────────────────────────
 cooling_off as (
     select distinct customer_msisdn as msisdn
     from analytics.momo_loan_book_tracker_loan_state_daily
     where date_key        = {RUN_DATE_KEY}
-      and partner_name   != 'Xtrafloat'
       and loan_status    in ('CLOSED', 'SETTLED')
       and last_repayment_date   is not null
       and last_disbursement_date is not null
