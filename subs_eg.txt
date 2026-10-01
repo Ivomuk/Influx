@@ -114,20 +114,17 @@ active_overdue_60d as (
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Rule 6: 90-day cooling-off after a delayed loan repayment.
--- "Delayed" = repayment > due date + 30 days. Loan term = 30 days, so
--- due date = disbursement + 30 days, making the trigger:
---   last_repayment_date > last_disbursement_date + 60 days
---   i.e. date_diff(last_disbursement_date, last_repayment_date) > 60
--- Cooling-off runs 90 days from the actual repayment date.
+-- "Delayed" = overdue by more than 30 days past the due date (days_aging > 30).
+-- Cooling-off starts after repayment and runs for 90 days.
+-- outstanding_ugx = 0 confirms the loan has been fully repaid.
 -- ─────────────────────────────────────────────────────────────────────────────
 cooling_off as (
     select distinct customer_msisdn as msisdn
     from analytics.momo_loan_book_tracker_loan_state_daily
-    where date_key        = {RUN_DATE_KEY}
-      and loan_status    in ('CLOSED', 'SETTLED', 'OVERPAID')
-      and last_repayment_date   is not null
-      and last_disbursement_date is not null
-      and date_diff('day', last_disbursement_date, last_repayment_date) > 60
+    where date_key            = {RUN_DATE_KEY}
+      and last_repayment_date is not null
+      and outstanding_ugx     = 0
+      and days_aging          > 30
       and date_parse(cast({RUN_DATE_KEY} as varchar), '%Y%m%d')
           between last_repayment_date
               and date_add('day', 90, last_repayment_date)
