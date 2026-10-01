@@ -124,7 +124,7 @@ cooling_off as (
     select distinct customer_msisdn as msisdn
     from analytics.momo_loan_book_tracker_loan_state_daily
     where date_key        = {RUN_DATE_KEY}
-      and loan_status    in ('CLOSED', 'SETTLED')
+      and loan_status    in ('CLOSED', 'SETTLED', 'OVERPAID')
       and last_repayment_date   is not null
       and last_disbursement_date is not null
       and date_diff('day', last_disbursement_date, last_repayment_date) > 60
