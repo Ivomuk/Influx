@@ -88,18 +88,14 @@ active_overdue_60d as (
 
 cooling_off as (
     select distinct customer_msisdn as msisdn
-    from analytics.momo_loan_book_tracker_loan_state_daily
+    from analytics.momo_loan_book_tracker_xtrafloat_loan_state_daily
     where date_key              = 20260930
-      and outstanding_ugx       = 0
-      and last_repayment_date   is not null
-      and tenure_days           is not null
-      and date_diff('day',
-            date_add('day', tenure_days, last_disbursement_date),
-            last_repayment_date
-          ) > 30
+      and is_principal_settled  = true
+      and days_past_due         > 30
+      and closure_date          is not null
       and date_parse(cast(20260930 as varchar), '%Y%m%d')
-          between last_repayment_date
-              and date_add('day', 90, last_repayment_date)
+          between closure_date
+              and date_add('day', 90, closure_date)
 ),
 
 eligible as (
