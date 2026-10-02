@@ -89,10 +89,14 @@ active_overdue_60d as (
 cooling_off as (
     select distinct customer_msisdn as msisdn
     from analytics.momo_loan_book_tracker_loan_state_daily
-    where date_key            = 20260930
-      and last_repayment_date is not null
-      and outstanding_ugx     = 0
-      and days_aging          > 30
+    where date_key              = 20260930
+      and outstanding_ugx       = 0
+      and last_repayment_date   is not null
+      and tenure_days           is not null
+      and date_diff('day',
+            date_add('day', tenure_days, last_disbursement_date),
+            last_repayment_date
+          ) > 30
       and date_parse(cast(20260930 as varchar), '%Y%m%d')
           between last_repayment_date
               and date_add('day', 90, last_repayment_date)
