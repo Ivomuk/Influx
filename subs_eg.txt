@@ -1,5 +1,36 @@
 insert into {TARGET_MART_TABLE}
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Changes from original (subs_eg_original.txt):
+--
+-- Rule 1 (momo_age_180, was mau_180):
+--   Renamed CTE mau_180 → momo_age_180.
+--   Source changed from analytics.momo_rge_base_subscribers_v9 (proxy: was
+--   subscriber active 179 days ago?) to devdata.account_holder_dump (actual
+--   registration_date / activation_date). Parses registration_date first,
+--   falls back to activation_date, then checks date_diff >= 180 days.
+--
+-- Rule 5 (active_overdue_60d):
+--   Source changed from wamujap.fm_momo_loan_portfolio_cummulation
+--   (loan_repaid = 0, manual date diff on disbursement_date) to
+--   analytics.momo_loan_book_tracker_loan_state_daily (pre-computed
+--   outstanding_ugx > 0 and days_aging > 60).
+--
+-- Rule 6 (cooling_off):
+--   Source changed from wamujap.fm_momo_loan_portfolio_cummulation
+--   (loan_repaid = 1, repayment_date, disbursement_date) to
+--   analytics.momo_loan_book_tracker_xtrafloat_loan_state_daily
+--   (is_principal_settled = true, days_past_due > 30, closure_date).
+--   Uses max(date_key) instead of {RUN_DATE_KEY} because the xtrafloat
+--   table lags the run date — settled loan records are immutable so the
+--   latest partition gives the correct cooling-off population.
+--
+-- eligible CTE:
+--   Join updated from mau_180 → momo_age_180 to match renamed CTE.
+--
+-- Unchanged: raw_txns, sub_activity, mau_30, derisk_exclusions, final SELECT.
+-- ─────────────────────────────────────────────────────────────────────────────
+
 with
 
 -- ─────────────────────────────────────────────────────────────────────────────
