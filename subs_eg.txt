@@ -147,10 +147,12 @@ active_overdue_60d as (
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Rule 6: 90-day cooling-off after a delayed loan repayment.
--- "Delayed" = principal repaid with days_past_due > 30.
--- days_past_due is frozen at the value when repayment was made.
--- Cooling-off runs 90 days from closure_date (repayment date).
--- Source: xtrafloat table retains settled loan history; loan_state_daily does not.
+-- "Delayed" = repaid more than 30 days past due date.
+-- Due date = last_disbursement_date + tenure_days.
+-- Scans 90-day window of partitions: closed loans appear on repayment day
+-- then drop from subsequent partitions. tenure_days IS NOT NULL excludes
+-- MOMO-ADVANCE and XTRAFLOAT-AGENT loans (same-day / agent loans with no
+-- tenure — these are not subject to subscriber cooling-off).
 -- ─────────────────────────────────────────────────────────────────────────────
 cooling_off as (
     select distinct customer_msisdn as msisdn
