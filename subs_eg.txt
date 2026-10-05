@@ -20,12 +20,14 @@ insert into {TARGET_MART_TABLE}
 --   Source changed from wamujap.fm_momo_loan_portfolio_cummulation
 --   (loan_repaid = 1, repayment_date, disbursement_date) to
 --   analytics.momo_loan_book_tracker_loan_state_daily.
---   Scans 90-day window of partitions (closed loans appear on repayment day
---   then drop from subsequent partitions). days_aging is NULL for settled
---   loans so lateness is derived from: date_diff(due_date, last_repayment_date)
---   > 30, where due_date = last_disbursement_date + tenure_days.
---   MOMO-ADVANCE loans excluded via tenure_days IS NOT NULL (they are same-day
---   micro-loans with no tenure and are not subject to cooling-off).
+--   Scans 90-day window of partitions — closed loans appear in the snapshot
+--   on the day of repayment then drop from subsequent partitions.
+--   days_aging is NULL for settled loans so lateness is computed as:
+--     date_diff('day', last_disbursement_date + tenure_days, last_repayment_date) > 30
+--   where (last_disbursement_date + tenure_days) is the loan due date.
+--   tenure_days IS NOT NULL implicitly excludes MOMO-ADVANCE (same-day
+--   micro-loans) and XTRAFLOAT-AGENT (agent loans) — both have tenure_days
+--   NULL and are not subject to subscriber cooling-off.
 --
 -- eligible CTE:
 --   Join updated from mau_180 → momo_age_180 to match renamed CTE.
